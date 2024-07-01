@@ -279,7 +279,8 @@ class UrlResponse:
     @property
     def contents(self) -> bytes:
         if self._response.content is None:
-            return b""
+            # typeshed bug: https://github.com/python/typeshed/pull/12180
+            return b""  # type: ignore
         return self._response.content
 
     @property
@@ -423,19 +424,12 @@ def readurl(
     if retries:
         manual_tries = max(int(retries) + 1, 1)
 
-    def_headers = {
-        "User-Agent": "Cloud-Init/%s" % (version.version_string()),
-    }
-    if headers:
-        def_headers.update(headers)
-    headers = def_headers
+    user_agent = "Cloud-Init/%s" % (version.version_string())
+    if headers is not None:
+        headers = headers.copy()
+    else:
+        headers = {}
 
-    if not headers_cb:
-
-        def _cb(url):
-            return headers
-
-        headers_cb = _cb
     if data:
         req_args["data"] = data
     if sec_between is None:
@@ -447,7 +441,13 @@ def readurl(
     # Handle retrying ourselves since the built-in support
     # doesn't handle sleeping between tries...
     for i in count():
-        req_args["headers"] = headers_cb(url)
+        if headers_cb:
+            headers = headers_cb(url)
+
+        if "User-Agent" not in headers:
+            headers["User-Agent"] = user_agent
+
+        req_args["headers"] = headers
         filtered_req_args = {}
         for (k, v) in req_args.items():
             if k == "data":
@@ -560,7 +560,7 @@ def dual_stack(
     """
     return_result = None
     returned_address = None
-    last_exception = None
+    last_exception: Optional[BaseException] = None
     exceptions = []
     is_done = threading.Event()
 
@@ -620,7 +620,7 @@ def dual_stack(
             "Timed out waiting for addresses: %s, "
             "exception(s) raised while waiting: %s",
             " ".join(addresses),
-            " ".join(exceptions),  # type: ignore
+            " ".join(map(str, exceptions)),
         )
     finally:
         executor.shutdown(wait=False)
@@ -693,7 +693,7 @@ def wait_for_url(
         if max_wait in (float("inf"), None):
             return False
         return (max_wait <= 0) or (
-            time.time() - start_time + sleep_time > max_wait
+            time.monotonic() - start_time + sleep_time > max_wait
         )
 
     def handle_url_response(response, url):
@@ -736,7 +736,7 @@ def wait_for_url(
         except Exception as e:
             reason = "unexpected error [%s]" % e
             url_exc = e
-        time_taken = int(time.time() - start_time)
+        time_taken = int(time.monotonic() - start_time)
         max_wait_str = "%ss" % max_wait if max_wait else "unlimited"
         status_msg = "Calling '%s' failed [%s/%s]: %s" % (
             url or getattr(url_exc, "url", "url ? None"),
@@ -770,7 +770,7 @@ def wait_for_url(
             return (url, read_url_cb(url, timeout))
 
         for url in urls:
-            now = time.time()
+            now = time.monotonic()
             if loop_n != 0:
                 if timeup(max_wait, start_time):
                     return
@@ -804,7 +804,7 @@ def wait_for_url(
         if out:
             return out
 
-    start_time = time.time()
+    start_time = time.monotonic()
     if sleep_time and sleep_time_cb:
         raise ValueError("sleep_time and sleep_time_cb are mutually exclusive")
 
@@ -840,7 +840,7 @@ def wait_for_url(
         time.sleep(current_sleep_time)
 
         # shorten timeout to not run way over max_time
-        current_time = time.time()
+        current_time = time.monotonic()
         if timeout and current_time + timeout > start_time + max_wait:
             timeout = max_wait - (current_time - start_time)
             if timeout <= 0:

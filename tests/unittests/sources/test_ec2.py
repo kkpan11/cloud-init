@@ -12,7 +12,7 @@ import requests
 import responses
 
 from cloudinit import helpers
-from cloudinit.net import activators
+from cloudinit.net import netplan
 from cloudinit.sources import DataSourceEc2 as ec2
 from cloudinit.sources import NicOrder
 from tests.unittests.helpers import example_netdev
@@ -197,6 +197,43 @@ NIC2_MD_IPV4_IPV6_MULTI_IP = {
     "vpc-ipv6-cidr-blocks": "2600:1f16:292:100::/56",
 }
 
+MULTI_NIC_V6_ONLY_MD = {
+    "macs": {
+        "02:6b:df:a2:4b:2b": {
+            "device-number": "1",
+            "interface-id": "eni-0669816d0cf606123",
+            "ipv6s": "2600:1f16:67f:f201:8d2e:4d1f:9e80:4ab9",
+            "local-hostname": "i-0951b6d0b66337123.us-east-2.compute.internal",
+            "mac": "02:6b:df:a2:4b:2b",
+            "owner-id": "483410185123",
+            "security-group-ids": "sg-0bf34e5c3cde1d123",
+            "security-groups": "default",
+            "subnet-id": "subnet-0903f279682c66123",
+            "subnet-ipv6-cidr-blocks": "2600:1f16:67f:f201:0:0:0:0/64",
+            "vpc-id": "vpc-0ac1befb8c824a123",
+            "vpc-ipv4-cidr-block": "192.168.0.0/20",
+            "vpc-ipv4-cidr-blocks": "192.168.0.0/20",
+            "vpc-ipv6-cidr-blocks": "2600:1f16:67f:f200:0:0:0:0/56",
+        },
+        "02:7c:03:b8:5c:af": {
+            "device-number": "0",
+            "interface-id": "eni-0f3cddb84c16e1123",
+            "ipv6s": "2600:1f16:67f:f201:6613:29a2:dbf7:2f1f",
+            "local-hostname": "i-0951b6d0b66337123.us-east-2.compute.internal",
+            "mac": "02:7c:03:b8:5c:af",
+            "owner-id": "483410185123",
+            "security-group-ids": "sg-0bf34e5c3cde1d123",
+            "security-groups": "default",
+            "subnet-id": "subnet-0903f279682c66123",
+            "subnet-ipv6-cidr-blocks": "2600:1f16:67f:f201:0:0:0:0/64",
+            "vpc-id": "vpc-0ac1befb8c824a123",
+            "vpc-ipv4-cidr-block": "192.168.0.0/20",
+            "vpc-ipv4-cidr-blocks": "192.168.0.0/20",
+            "vpc-ipv6-cidr-blocks": "2600:1f16:67f:f200:0:0:0:0/56",
+        },
+    }
+}
+
 SECONDARY_IP_METADATA_2018_09_24 = {
     "ami-id": "ami-0986c2ac728528ac2",
     "ami-launch-index": "0",
@@ -259,7 +296,7 @@ def disable_is_resolvable():
 
 
 def _register_ssh_keys(rfunc, base_url, keys_data):
-    """handle ssh key inconsistencies.
+    r"""handle ssh key inconsistencies.
 
     public-keys in the ec2 metadata is inconsistently formated compared
     to other entries.
@@ -295,7 +332,7 @@ def _register_ssh_keys(rfunc, base_url, keys_data):
 
 
 def register_mock_metaserver(base_url, data, responses_mock=None):
-    """Register with responses a ec2 metadata like service serving 'data'.
+    r"""Register with responses a ec2 metadata like service serving 'data'.
 
     If given a dictionary, it will populate urls under base_url for
     that dictionary.  For example, input of
@@ -349,7 +386,6 @@ class TestEc2:
 
     valid_platform_data = {
         "uuid": "ec212f79-87d1-2f1d-588f-d86dc0fd5412",
-        "uuid_source": "dmi",
         "serial": "ec212f79-87d1-2f1d-588f-d86dc0fd5412",
     }
 
@@ -855,7 +891,7 @@ class TestEc2:
         """Unknown platform data with strict_id true should return False."""
         uuid = "ab439480-72bf-11d3-91fc-b8aded755F9a"
         ds = self._setup_ds(
-            platform_data={"uuid": uuid, "uuid_source": "dmi", "serial": ""},
+            platform_data={"uuid": uuid, "serial": ""},
             sys_cfg={"datasource": {"Ec2": {"strict_id": True}}},
             md={"md": DEFAULT_METADATA},
             mocker=mocker,
@@ -869,7 +905,7 @@ class TestEc2:
         """Unknown platform data with strict_id false should return True."""
         uuid = "ab439480-72bf-11d3-91fc-b8aded755F9a"
         ds = self._setup_ds(
-            platform_data={"uuid": uuid, "uuid_source": "dmi", "serial": ""},
+            platform_data={"uuid": uuid, "serial": ""},
             sys_cfg={"datasource": {"Ec2": {"strict_id": False}}},
             md={"md": DEFAULT_METADATA},
             mocker=mocker,
@@ -1547,7 +1583,7 @@ class TestConvertEc2MetadataNetworkConfig:
             },
         }
         distro = mock.Mock()
-        distro.network_activator = activators.NetplanActivator
+        distro.network_renderer = netplan.Renderer()
         distro.dhcp_client.dhcp_discovery.return_value = {
             "routers": "172.31.1.0"
         }
@@ -1621,13 +1657,64 @@ class TestConvertEc2MetadataNetworkConfig:
             },
         }
         distro = mock.Mock()
-        distro.network_activator = activators.NetplanActivator
+        distro.network_renderer = netplan.Renderer()
         distro.dhcp_client.dhcp_discovery.return_value = {
             "routers": "172.31.1.0"
         }
         assert expected == ec2.convert_ec2_metadata_network_config(
             network_metadata_both, distro, macs_to_nics
         )
+
+    def test_convert_ec2_metadata_network_config_multi_nics_ipv6_only(self):
+        """Like above, but only ipv6s are present in metadata."""
+        macs_to_nics = {
+            "02:7c:03:b8:5c:af": "eth0",
+            "02:6b:df:a2:4b:2b": "eth1",
+        }
+        mac_data = copy.deepcopy(MULTI_NIC_V6_ONLY_MD)
+        network_metadata = {"interfaces": mac_data}
+        expected = {
+            "version": 2,
+            "ethernets": {
+                "eth0": {
+                    "dhcp4": True,
+                    "dhcp4-overrides": {"route-metric": 100},
+                    "dhcp6": True,
+                    "match": {"macaddress": "02:7c:03:b8:5c:af"},
+                    "set-name": "eth0",
+                    "dhcp6-overrides": {"route-metric": 100},
+                },
+                "eth1": {
+                    "dhcp4": True,
+                    "dhcp4-overrides": {
+                        "route-metric": 200,
+                        "use-routes": True,
+                    },
+                    "dhcp6": True,
+                    "match": {"macaddress": "02:6b:df:a2:4b:2b"},
+                    "set-name": "eth1",
+                    "routes": [
+                        {"to": "2600:1f16:67f:f201:0:0:0:0/64", "table": 101},
+                    ],
+                    "routing-policy": [
+                        {
+                            "from": "2600:1f16:67f:f201:8d2e:4d1f:9e80:4ab9",
+                            "table": 101,
+                        },
+                    ],
+                    "dhcp6-overrides": {
+                        "route-metric": 200,
+                        "use-routes": True,
+                    },
+                },
+            },
+        }
+        distro = mock.Mock()
+        distro.network_renderer = netplan.Renderer()
+        assert expected == ec2.convert_ec2_metadata_network_config(
+            network_metadata, distro, macs_to_nics
+        )
+        distro.dhcp_client.dhcp_discovery.assert_not_called()
 
     def test_convert_ec2_metadata_network_config_handles_dhcp4_and_dhcp6(self):
         """Config both dhcp4 and dhcp6 when both vpc-ipv6 and ipv4 exists."""
@@ -1673,19 +1760,34 @@ class TestConvertEc2MetadataNetworkConfig:
             )
 
 
-class TesIdentifyPlatform:
+class TestIdentifyPlatform:
     def collmock(self, **kwargs):
         """return non-special _collect_platform_data updated with changes."""
         unspecial = {
             "asset_tag": "3857-0037-2746-7462-1818-3997-77",
             "serial": "H23-C4J3JV-R6",
             "uuid": "81c7e555-6471-4833-9551-1ab366c4cfd2",
-            "uuid_source": "dmi",
             "vendor": "tothecloud",
             "product_name": "cloudproduct",
         }
         unspecial.update(**kwargs)
         return unspecial
+
+    @mock.patch("cloudinit.sources.DataSourceEc2._collect_platform_data")
+    def test_identify_aws(self, m_collect):
+        """aws should be identified if uuid starts with ec2"""
+        m_collect.return_value = self.collmock(
+            uuid="ec2E1916-9099-7CAF-FD21-012345ABCDEF"
+        )
+        assert ec2.CloudNames.AWS == ec2.identify_platform()
+
+    @mock.patch("cloudinit.sources.DataSourceEc2._collect_platform_data")
+    def test_identify_aws_endian(self, m_collect):
+        """aws should be identified if uuid starts with ec2"""
+        m_collect.return_value = self.collmock(
+            uuid="45E12AEC-DCD1-B213-94ED-012345ABCDEF"
+        )
+        assert ec2.CloudNames.AWS == ec2.identify_platform()
 
     @mock.patch("cloudinit.sources.DataSourceEc2._collect_platform_data")
     def test_identify_aliyun(self, m_collect):

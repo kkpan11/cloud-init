@@ -62,7 +62,7 @@ disable_root: true
                    "openmandriva", "photon", "TencentOS"] or is_rhel %}
 
 {% if is_rhel %}
-mount_default_fields: [~, ~, 'auto', 'defaults,nofail,x-systemd.requires=cloud-init.service,_netdev', '0', '2']
+mount_default_fields: [~, ~, 'auto', 'defaults,nofail,x-systemd.after=cloud-init.service,_netdev', '0', '2']
 {% else %}
 mount_default_fields: [~, ~, 'auto', 'defaults,nofail', '0', '2']
 {% endif %}
@@ -137,6 +137,7 @@ cloud_init_modules:
   - rsyslog
   - users_groups
   - ssh
+  - set_passwords
 
 # The modules that run in the 'config' stage
 cloud_config_modules:
@@ -156,7 +157,6 @@ cloud_config_modules:
 {% endif %}
   - locale
 {% endif %}
-  - set_passwords
 {% if variant == "alpine" %}
   - apk_configure
 {% elif variant in ["debian", "ubuntu", "unknown"] %}
