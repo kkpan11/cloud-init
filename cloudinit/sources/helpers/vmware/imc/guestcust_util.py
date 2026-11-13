@@ -1,8 +1,10 @@
 # Copyright (C) 2016 Canonical Ltd.
-# Copyright (C) 2016-2023 VMware Inc.
+# Copyright (C) 2006-2024 Broadcom. All Rights Reserved.
+# Broadcom Confidential. The term "Broadcom" refers to Broadcom Inc.
+# and/or its subsidiaries.
 #
 # Author: Sankar Tanguturi <stanguturi@vmware.com>
-#         Pengpeng Sun <pegnpengs@vmware.com>
+#         Pengpeng Sun <pengpeng.sun@broadcom.com>
 #
 # This file is part of cloud-init. See LICENSE file for license information.
 
@@ -13,7 +15,7 @@ import time
 
 import yaml
 
-from cloudinit import subp, util
+from cloudinit import performance, subp, util
 
 from .config import Config
 from .config_custom_script import PostCustomScript, PreCustomScript
@@ -48,7 +50,7 @@ def send_rpc(rpc):
 
     try:
         logger.debug("Sending RPC command: %s", rpc)
-        (out, err) = subp.subp(["vmware-rpctool", rpc], rcs=[0])
+        out, err = subp.subp(["vmware-rpctool", rpc], rcs=[0])
         # Remove the trailing newline in the output.
         if out:
             out = out.rstrip()
@@ -70,7 +72,7 @@ def set_customization_status(custstate, custerror, errormessage=None):
         message = CLOUDINIT_LOG_FILE
 
     rpc = "deployPkg.update.state %d %d %s" % (custstate, custerror, message)
-    (out, err) = send_rpc(rpc)
+    out, err = send_rpc(rpc)
     return (out, err)
 
 
@@ -87,7 +89,9 @@ def get_nics_to_enable(nicsfilepath):
     if not os.path.exists(nicsfilepath):
         return None
 
-    with open(nicsfilepath, "r") as fp:
+    with performance.Timed(f"Reading {nicsfilepath}"), open(
+        nicsfilepath, "r"
+    ) as fp:
         nics = fp.read(NICS_SIZE)
 
     return nics
@@ -106,7 +110,7 @@ def enable_nics(nics):
 
     for attempt in range(enableNicsWaitRetries):
         logger.debug("Trying to connect interfaces, attempt %d", attempt)
-        (out, _err) = set_customization_status(
+        out, _err = set_customization_status(
             GuestCustStateEnum.GUESTCUST_STATE_RUNNING,
             GuestCustEventEnum.GUESTCUST_EVENT_ENABLE_NICS,
             nics,
@@ -120,7 +124,7 @@ def enable_nics(nics):
             return
 
         for count in range(enableNicsWaitCount):
-            (out, _err) = set_customization_status(
+            out, _err = set_customization_status(
                 GuestCustStateEnum.GUESTCUST_STATE_RUNNING,
                 GuestCustEventEnum.GUESTCUST_EVENT_QUERY_NICS,
                 nics,
@@ -207,7 +211,7 @@ def get_data_from_imc_cust_cfg(
 ):
     md, ud, vd, cfg = {}, None, None, {}
     set_gc_status(cust_cfg, "Started")
-    (md, cfg) = get_non_network_data_from_vmware_cust_cfg(cust_cfg)
+    md, cfg = get_non_network_data_from_vmware_cust_cfg(cust_cfg)
     is_special_customization = check_markers(cloud_dir, cust_cfg)
     if is_special_customization:
         if not do_special_customization(
@@ -323,23 +327,19 @@ def get_non_network_data_from_vmware_cust_cfg(cust_cfg):
 def get_network_data_from_vmware_cust_cfg(
     cust_cfg, use_system_devices=True, configure=False, osfamily=None
 ):
-    nicConfigurator = NicConfigurator(cust_cfg.nics, use_system_devices)
-    nics_cfg_list = nicConfigurator.generate(configure, osfamily)
-
-    return get_v1_network_config(
-        nics_cfg_list, cust_cfg.name_servers, cust_cfg.dns_suffixes
+    nicConfigurator = NicConfigurator(
+        cust_cfg.nics,
+        cust_cfg.name_servers,
+        cust_cfg.dns_suffixes,
+        use_system_devices,
     )
+    ethernets_dict = nicConfigurator.generate(configure, osfamily)
+
+    return gen_v2_network_config(ethernets_dict)
 
 
-def get_v1_network_config(nics_cfg_list=None, nameservers=None, search=None):
-    config_list = nics_cfg_list
-
-    if nameservers or search:
-        config_list.append(
-            {"type": "nameserver", "address": nameservers, "search": search}
-        )
-
-    return {"version": 1, "config": config_list}
+def gen_v2_network_config(ethernets_dict):
+    return {"version": 2, "ethernets": ethernets_dict}
 
 
 def connect_nics(cust_cfg_dir):
@@ -367,12 +367,10 @@ def get_cust_cfg_file(ds_cfg):
     # that required metadata and userdata files are now
     # present.
     max_wait = get_max_wait_from_cfg(ds_cfg)
-    cust_cfg_file_path = util.log_time(
-        logfunc=logger.debug,
-        msg="Waiting for VMware customization configuration file",
-        func=wait_for_cust_cfg_file,
-        args=("cust.cfg", max_wait),
-    )
+    with performance.Timed(
+        "Waiting for VMware customization configuration file"
+    ):
+        cust_cfg_file_path = wait_for_cust_cfg_file("cust.cfg", max_wait)
     if cust_cfg_file_path:
         logger.debug(
             "Found VMware customization configuration file at %s",

@@ -2,6 +2,7 @@
 
 import copy
 import logging
+import string
 from unittest import mock
 
 import pytest
@@ -26,7 +27,9 @@ SYSTEMD_CHECK_CALL = mock.call(
     ["systemctl", "show", "--property", "ActiveState", "--value", "ssh"]
 )
 SYSTEMD_RESTART_CALL = mock.call(
-    ["systemctl", "restart", "ssh"], capture=True, rcs=None
+    ["systemctl", "restart", "ssh", "--job-mode=ignore-dependencies"],
+    capture=True,
+    rcs=None,
 )
 SERVICE_RESTART_CALL = mock.call(
     ["service", "ssh", "restart"], capture=True, rcs=None
@@ -36,7 +39,7 @@ SERVICE_RESTART_CALL = mock.call(
 @pytest.fixture(autouse=True)
 def common_fixtures(mocker):
     mocker.patch("cloudinit.distros.uses_systemd", return_value=True)
-    mocker.patch("cloudinit.util.write_to_console")
+    mocker.patch("cloudinit.log.log_util.write_to_console")
 
 
 class TestHandleSSHPwauth:
@@ -151,10 +154,14 @@ class TestSetPasswordsHandle:
         """handle parses command password hashes."""
         cloud = get_cloud()
         valid_hashed_pwds = [
-            "root:$2y$10$8BQjxjVByHA/Ee.O1bCXtO8S7Y5WojbXWqnqYpUW.BrPx/"
-            "Dlew1Va",
-            "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoakMMC7dR52q"
-            "SDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXazGGx3oo1",
+            (
+                "root:$2y$10$8BQjxjVByHA/Ee.O1bCXtO8S7Y5WojbXWqnqYpUW.BrPx/"
+                "Dlew1Va"
+            ),
+            (
+                "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoakMMC7dR52q"
+                "SDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXazGGx3oo1"
+            ),
         ]
         cfg = {"chpasswd": {"list": valid_hashed_pwds}}
         with mock.patch.object(setpass.Distro, "chpasswd") as chpasswd:
@@ -268,7 +275,7 @@ class TestSetPasswordsHandle:
     )
     def test_random_passwords(self, user_cfg, mocker, caplog):
         """handle parses command set random passwords."""
-        m_multi_log = mocker.patch(f"{MODPATH}util.multi_log")
+        m_multi_log = mocker.patch(f"{MODPATH}log_util.multi_log")
         mocker.patch(f"{MODPATH}subp.subp")
 
         cloud = get_cloud()
@@ -307,14 +314,20 @@ class TestSetPasswordsHandle:
                 {
                     "chpasswd": {
                         "list": [
-                            "root:$2y$10$8BQjxjVByHA/Ee.O1bCXtO8S7Y5WojbXWqnqY"
-                            "pUW.BrPx/Dlew1Va",
-                            "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
-                            "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
-                            "GGx3oo1",
-                            "dog:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoakMMC"
-                            "7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXazGGx"
-                            "3oo1",
+                            (
+                                "root:$2y$10$8BQjxjVByHA/Ee.O1bCXtO8S7Y5WojbXWqnqY"
+                                "pUW.BrPx/Dlew1Va"
+                            ),
+                            (
+                                "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
+                                "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
+                                "GGx3oo1"
+                            ),
+                            (
+                                "dog:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoakMMC"
+                                "7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXazGGx"
+                                "3oo1"
+                            ),
                             "Till:RANDOM",
                         ]
                     }
@@ -354,14 +367,20 @@ class TestSetPasswordsHandle:
                 {
                     "chpasswd": {
                         "list": [
-                            "root:$2y$10$8BQjxjVByHA/Ee.O1bCXtO8S7Y5WojbXWqnqY"
-                            "pUW.BrPx/Dlew1Va",
-                            "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
-                            "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
-                            "GGx3oo1",
-                            "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
-                            "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
-                            "GGx3oo1",
+                            (
+                                "root:$2y$10$8BQjxjVByHA/Ee.O1bCXtO8S7Y5WojbXWqnqY"
+                                "pUW.BrPx/Dlew1Va"
+                            ),
+                            (
+                                "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
+                                "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
+                                "GGx3oo1"
+                            ),
+                            (
+                                "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
+                                "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
+                                "GGx3oo1"
+                            ),
                         ]
                     }
                 },
@@ -395,14 +414,20 @@ class TestSetPasswordsHandle:
                 {
                     "chpasswd": {
                         "list": [
-                            "root:$2y$10$8BQjxjVByHA/Ee.O1bCXtO8S7Y5WojbXWqnqY"
-                            "pUW.BrPx/Dlew1Va",
-                            "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
-                            "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
-                            "GGx3oo1",
-                            "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
-                            "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
-                            "GGx3oo1",
+                            (
+                                "root:$2y$10$8BQjxjVByHA/Ee.O1bCXtO8S7Y5WojbXWqnqY"
+                                "pUW.BrPx/Dlew1Va"
+                            ),
+                            (
+                                "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
+                                "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
+                                "GGx3oo1"
+                            ),
+                            (
+                                "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
+                                "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
+                                "GGx3oo1"
+                            ),
                         ]
                     }
                 },
@@ -423,9 +448,11 @@ class TestSetPasswordsHandle:
                             },
                         ],
                         "list": [
-                            "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
-                            "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
-                            "GGx3oo1",
+                            (
+                                "ubuntu:$6$5hOurLPO$naywm3Ce0UlmZg9gG2Fl9acWCVEoak"
+                                "MMC7dR52qSDexZbrN9z8yHxhUM2b.sxpguSwOlbOQSW/HpXaz"
+                                "GGx3oo1"
+                            ),
                         ],
                     }
                 },
@@ -557,6 +584,41 @@ class TestExpire:
         else:
             assert m_expire.call_args_list == []
             assert "Expired passwords" not in caplog.text
+
+
+class TestRandUserPassword:
+    def _get_str_class_num(self, str):
+        return sum(
+            [
+                any(c.islower() for c in str),
+                any(c.isupper() for c in str),
+                any(c.isdigit() for c in str),
+                any(c in string.punctuation for c in str),
+            ]
+        )
+
+    @pytest.mark.parametrize(
+        "strlen, expected_result",
+        [
+            (1, ValueError),
+            (2, ValueError),
+            (3, ValueError),
+            (4, 4),
+            (5, 4),
+            (20, 4),
+        ],
+    )
+    def test_rand_user_password(self, strlen, expected_result):
+        if expected_result is ValueError:
+            with pytest.raises(
+                expected_result,
+                match="Password length must be at least 4 characters.",
+            ):
+                setpass.rand_user_password(strlen)
+        else:
+            rand_password = setpass.rand_user_password(strlen)
+            assert len(rand_password) == strlen
+            assert self._get_str_class_num(rand_password) == expected_result
 
 
 class TestSetPasswordsSchema:

@@ -36,7 +36,6 @@ MERGE_HEADER = "Merge-Type"
 # a: 22
 #
 # This gets loaded into yaml with final result {'a': 22}
-DEF_MERGERS = mergers.string_extract_mergers("dict(replace)+list()+str()")
 CLOUD_PREFIX = "#cloud-config"
 JSONP_PREFIX = "#cloud-config-jsonp"
 
@@ -103,7 +102,9 @@ class CloudConfigPartHandler(handlers.Handler):
         all_mergers.extend(mergers_yaml)
         all_mergers.extend(mergers_header)
         if not all_mergers:
-            all_mergers = DEF_MERGERS
+            all_mergers = mergers.string_extract_mergers(
+                "dict(replace)+list()+str()"
+            )
         return (payload_yaml, all_mergers)
 
     def _merge_patch(self, payload):
@@ -118,7 +119,7 @@ class CloudConfigPartHandler(handlers.Handler):
         self.cloud_buf = patch.apply(self.cloud_buf, in_place=False)
 
     def _merge_part(self, payload, headers):
-        (payload_yaml, my_mergers) = self._extract_mergers(payload, headers)
+        payload_yaml, my_mergers = self._extract_mergers(payload, headers)
         LOG.debug("Merging by applying %s", my_mergers)
         merger = mergers.construct(my_mergers)
         self.cloud_buf = merger.merge(self.cloud_buf, payload_yaml)

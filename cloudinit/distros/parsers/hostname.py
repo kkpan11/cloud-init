@@ -22,13 +22,13 @@ class HostnameConf:
     def __str__(self):
         self.parse()
         contents = StringIO()
-        for (line_type, components) in self._contents:
+        for line_type, components in self._contents:
             if line_type == "blank":
                 contents.write("%s\n" % (components[0]))
             elif line_type == "all_comment":
                 contents.write("%s\n" % (components[0]))
             elif line_type == "hostname":
-                (hostname, tail) = components
+                hostname, tail = components
                 contents.write("%s%s\n" % (hostname, tail))
         # Ensure trailing newline
         contents = contents.getvalue()
@@ -39,7 +39,7 @@ class HostnameConf:
     @property
     def hostname(self):
         self.parse()
-        for (line_type, components) in self._contents:
+        for line_type, components in self._contents:
             if line_type == "hostname":
                 return components[0]
         return None
@@ -50,7 +50,7 @@ class HostnameConf:
             return
         self.parse()
         replaced = False
-        for (line_type, components) in self._contents:
+        for line_type, components in self._contents:
             if line_type == "hostname":
                 components[0] = str(your_hostname)
                 replaced = True
@@ -64,7 +64,7 @@ class HostnameConf:
             if not len(line.strip()):
                 entries.append(("blank", [line]))
                 continue
-            (head, tail) = chop_comment(line.strip(), "#")
+            head, tail = chop_comment(line.strip(), "#")
             if not len(head):
                 entries.append(("all_comment", [line]))
                 continue

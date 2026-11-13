@@ -37,7 +37,7 @@ For example the following could be present in
 
   network:
     version: 2
-    ethernets: []
+    ethernets: {}
 
 It may also be provided in other locations including the
 :ref:`datasource_nocloud`. See :ref:`network_config` for other places.
@@ -65,8 +65,8 @@ currently being defined.
 There are two physically/structurally different classes of device definitions,
 and the ID field has a different interpretation for each:
 
-Physical devices (e.g., ethernet, wifi)
----------------------------------------
+Physical devices (e.g., ethernet, Wi-Fi)
+----------------------------------------
 
 These can dynamically come and go between reboots and even during runtime
 (hotplugging). In the generic case, they can be selected by ``match:``
@@ -151,13 +151,19 @@ Example: ::
 ``set-name: <(scalar)>``
 ------------------------
 
-When matching on unique properties such as path or MAC, or with additional
-assumptions such as "there will only ever be one wifi device", match rules
-can be written so that they only match one device. Then this property can be
+When matching on unique properties such as MAC, match rules
+can be written so that they match only one device. Then this property can be
 used to give that device a more specific/desirable/nicer name than the default
 from udev’s ``ifnames``. Any additional device that satisfies the match rules
 will then fail to get renamed and keep the original kernel name (and dmesg
 will show an error).
+
+While multiple properties can be used in a match, ``macaddress`` is
+**required** for cloud-init to perform the rename.
+
+.. note::
+    On a netplan-based system, cloud-init will perform the rename
+    independently and prior to netplan.
 
 ``wakeonlan: <(bool)>``
 -----------------------
@@ -235,10 +241,12 @@ Example: ::
 
 Add static addresses to the interface in addition to the ones received
 through DHCP or RA. Each sequence entry is in CIDR notation, i.e., of the
-form ``addr/prefixlen``. ``addr`` is an IPv4 or IPv6 address as recognised
+form ``addr/prefixlen``. ``addr`` is an IPv4 or IPv6 address as recognized
 by ``inet_pton(3)`` and ``prefixlen`` the number of bits of the subnet.
 
-Example: ``addresses: [192.168.14.2/24, 2001:1::1/64]``
+Example: ::
+
+  addresses: [192.168.14.2/24, 2001:1::1/64]
 
 ``gateway4: or gateway6: <(scalar)>``
 -------------------------------------
@@ -246,10 +254,15 @@ Example: ``addresses: [192.168.14.2/24, 2001:1::1/64]``
 Deprecated, see `Netplan#default-routes`_.
 Set default gateway for IPv4/6, for manual address configuration. This
 requires setting ``addresses`` too. Gateway IPs must be in a form
-recognised by ``inet_pton(3)``
+recognized by ``inet_pton(3)``
 
-Example for IPv4: ``gateway4: 172.16.0.1``
-Example for IPv6: ``gateway6: 2001:4::1``
+Example for IPv4: ::
+
+  gateway4: 172.16.0.1
+
+Example for IPv6: ::
+
+  gateway6: 2001:4::1
 
 ``mtu: <MTU SizeBytes>``
 ------------------------
@@ -257,6 +270,14 @@ Example for IPv6: ``gateway6: 2001:4::1``
 The MTU key represents a device's Maximum Transmission Unit, the largest size
 packet or frame, specified in octets (eight-bit bytes), that can be sent in a
 packet- or frame-based network. Specifying ``mtu`` is optional.
+
+``optional: <(bool)>``
+------------------------
+
+Mark a device as not required for booting. By default networkd will wait for
+all configured interfaces to be configured before continuing to boot. This
+option causes networkd to not wait for the interface. This is only supported
+by networkd. The default is false.
 
 ``nameservers: <(mapping)>``
 ----------------------------
@@ -275,12 +296,15 @@ Example: ::
 -----------------------------------
 
 Add device specific routes. Each mapping includes a ``to``, ``via`` key
-with an IPv4 or IPv6 address as value. ``metric`` is an optional value.
+with an IPv4 or IPv6 address as value. ``to: default`` may be used to
+configure the default route. ``metric`` is an optional value.
+``table`` is an optional numeric ID or name of the routing table for
+policy-based routing.
 
 Example: ::
 
   routes:
-   - to: 0.0.0.0/0
+   - to: default  # could be 0.0.0.0/0 optionally
      via: 10.23.2.1
      metric: 3
 

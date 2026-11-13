@@ -8,11 +8,14 @@ events for reporting.
 The events here are designed to be used with reporting.
 They can be published to registered handlers with report_event.
 """
+
 import base64
+import logging
 import os.path
 import time
 from typing import List
 
+from cloudinit import performance
 from cloudinit.reporting import (
     available_handlers,
     instantiated_handler_registry,
@@ -23,6 +26,7 @@ FINISH_EVENT_TYPE = "finish"
 START_EVENT_TYPE = "start"
 
 DEFAULT_EVENT_ORIGIN = "cloudinit"
+LOG = logging.getLogger(__name__)
 
 
 class _nameset(set):
@@ -73,7 +77,12 @@ class ReportingEvent:
 
 class FinishReportingEvent(ReportingEvent):
     def __init__(
-        self, name, description, result=status.SUCCESS, post_files=None
+        self,
+        name,
+        description,
+        duration,
+        result=status.SUCCESS,
+        post_files=None,
     ):
         super(FinishReportingEvent, self).__init__(
             FINISH_EVENT_TYPE, name, description
@@ -82,18 +91,24 @@ class FinishReportingEvent(ReportingEvent):
         if post_files is None:
             post_files = []
         self.post_files = post_files
+        self.duration = duration
         if result not in status:
             raise ValueError("Invalid result: %s" % result)
 
     def as_string(self):
-        return "{0}: {1}: {2}: {3}".format(
-            self.event_type, self.name, self.result, self.description
+        return "{0}: {1}: {2}: {3} (duration: {4:.3f}s)".format(
+            self.event_type,
+            self.name,
+            self.result,
+            self.description,
+            self.duration,
         )
 
     def as_dict(self):
         """The event represented as json friendly."""
         data = super(FinishReportingEvent, self).as_dict()
         data["result"] = self.result
+        data["duration"] = round(self.duration, 4)
         if self.post_files:
             data["files"] = _collect_file_info(self.post_files)
         return data
@@ -131,14 +146,18 @@ def report_event(event, excluded_handler_types=None):
 
 
 def report_finish_event(
-    event_name, event_description, result=status.SUCCESS, post_files=None
+    event_name,
+    event_description,
+    duration,
+    result=status.SUCCESS,
+    post_files=None,
 ):
     """Report a "finish" event.
 
     See :py:func:`.report_event` for parameter details.
     """
     event = FinishReportingEvent(
-        event_name, event_description, result, post_files=post_files
+        event_name, event_description, duration, result, post_files=post_files
     )
     return report_event(event)
 
@@ -212,6 +231,7 @@ class ReportEventStack:
         self.message = message
         self.result_on_exception = result_on_exception
         self.result = status.SUCCESS
+        self.start_timestamp = None
         if post_files is None:
             post_files = []
         self.post_files = post_files
@@ -244,6 +264,7 @@ class ReportEventStack:
 
     def __enter__(self):
         self.result = status.SUCCESS
+        self.start_timestamp = time.monotonic()
         if self.reporting_enabled:
             report_start_event(self.fullname, self.description)
         if self.parent:
@@ -284,12 +305,20 @@ class ReportEventStack:
         return self._childrens_finish_info()
 
     def __exit__(self, exc_type, exc_value, traceback):
-        (result, msg) = self._finish_info(exc_value)
+        result, msg = self._finish_info(exc_value)
         if self.parent:
             self.parent.children[self.name] = (result, msg)
         if self.reporting_enabled:
+            if self.start_timestamp is not None:
+                duration = time.monotonic() - self.start_timestamp
+            else:
+                duration = 0.0
             report_finish_event(
-                self.fullname, msg, result, post_files=self.post_files
+                self.fullname,
+                msg,
+                duration=duration,
+                result=result,
+                post_files=self.post_files,
             )
 
 
@@ -301,7 +330,9 @@ def _collect_file_info(files):
         if not os.path.isfile(fname):
             content = None
         else:
-            with open(fname, "rb") as fp:
+            with performance.Timed(f"Reading {fname}"), open(
+                fname, "rb"
+            ) as fp:
                 content = base64.b64encode(fp.read()).decode()
         ret.append({"path": fname, "content": content, "encoding": "base64"})
     return ret

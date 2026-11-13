@@ -1,3 +1,4 @@
+import logging
 from collections import namedtuple
 from contextlib import ExitStack
 from unittest.mock import patch
@@ -5,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from cloudinit import subp
 from cloudinit.net.activators import (
     DEFAULT_PRIORITY,
     NAME_TO_ACTIVATOR,
@@ -81,67 +83,60 @@ def unavailable_mocks():
 
 class TestSearchAndSelect:
     def test_empty_list(self, available_mocks):
-        resp = search_activator(priority=DEFAULT_PRIORITY, target=None)
-        assert resp == [NAME_TO_ACTIVATOR[name] for name in DEFAULT_PRIORITY]
+        resp = search_activator(priority=DEFAULT_PRIORITY)
+        assert resp == NAME_TO_ACTIVATOR[DEFAULT_PRIORITY[0]]
 
         activator = select_activator()
         assert activator == NAME_TO_ACTIVATOR[DEFAULT_PRIORITY[0]]
 
     def test_priority(self, available_mocks):
         new_order = ["netplan", "network-manager"]
-        resp = search_activator(priority=new_order, target=None)
-        assert resp == [NAME_TO_ACTIVATOR[name] for name in new_order]
+        resp = search_activator(priority=new_order)
+        assert resp == NetplanActivator
 
         activator = select_activator(priority=new_order)
-        assert activator == NAME_TO_ACTIVATOR[new_order[0]]
-
-    def test_target(self, available_mocks):
-        search_activator(priority=DEFAULT_PRIORITY, target="/tmp")
-        assert "/tmp" == available_mocks.m_which.call_args[1]["target"]
-
-        select_activator(target="/tmp")
-        assert "/tmp" == available_mocks.m_which.call_args[1]["target"]
+        assert activator == NetplanActivator
 
     @patch(
         "cloudinit.net.activators.IfUpDownActivator.available",
         return_value=False,
     )
     def test_first_not_available(self, m_available, available_mocks):
-        resp = search_activator(priority=DEFAULT_PRIORITY, target=None)
-        assert resp == [
-            NAME_TO_ACTIVATOR[activator] for activator in DEFAULT_PRIORITY[1:]
-        ]
+        # We've mocked out IfUpDownActivator as unavailable, so expect the
+        # next in the list of default priorities
+        resp = search_activator(priority=DEFAULT_PRIORITY)
+        assert resp == NAME_TO_ACTIVATOR[DEFAULT_PRIORITY[1]]
 
         resp = select_activator()
         assert resp == NAME_TO_ACTIVATOR[DEFAULT_PRIORITY[1]]
 
     def test_priority_not_exist(self, available_mocks):
         with pytest.raises(ValueError):
-            search_activator(priority=["spam", "eggs"], target=None)
+            search_activator(priority=["spam", "eggs"])
         with pytest.raises(ValueError):
             select_activator(priority=["spam", "eggs"])
 
     def test_none_available(self, unavailable_mocks):
-        resp = search_activator(priority=DEFAULT_PRIORITY, target=None)
-        assert resp == []
+        resp = search_activator(priority=DEFAULT_PRIORITY)
+        assert resp is None
 
         with pytest.raises(NoActivatorException):
             select_activator()
 
 
 IF_UP_DOWN_AVAILABLE_CALLS = [
-    (("ifquery",), {"search": ["/sbin", "/usr/sbin"], "target": None}),
-    (("ifup",), {"search": ["/sbin", "/usr/sbin"], "target": None}),
-    (("ifdown",), {"search": ["/sbin", "/usr/sbin"], "target": None}),
+    (("ifquery",), {"search": ["/sbin", "/usr/sbin"]}),
+    (("ifup",), {"search": ["/sbin", "/usr/sbin"]}),
+    (("ifdown",), {"search": ["/sbin", "/usr/sbin"]}),
 ]
 
 NETPLAN_AVAILABLE_CALLS = [
-    (("netplan",), {"search": ["/usr/sbin", "/sbin"], "target": None}),
+    (("netplan",), {"search": ["/usr/sbin", "/sbin"]}),
 ]
 
 NETWORKD_AVAILABLE_CALLS = [
-    (("ip",), {"search": ["/usr/sbin", "/bin"], "target": None}),
-    (("systemctl",), {"search": ["/usr/sbin", "/bin"], "target": None}),
+    (("ip",), {"search": ["/usr/sbin", "/bin"]}),
+    (("systemctl",), {"search": ["/usr/sbin", "/bin"]}),
 ]
 
 
@@ -233,6 +228,21 @@ NETWORK_MANAGER_BRING_UP_CALL_LIST: list = [
     ),
 ]
 
+NETWORK_MANAGER_BRING_UP_ALL_CALL_LIST: list = [
+    (
+        (
+            [
+                "systemctl",
+                "show",
+                "--property=SubState",
+                "NetworkManager.service",
+            ],
+        ),
+        {},
+    ),
+    ((["systemctl", "try-reload-or-restart", "NetworkManager.service"],), {}),
+] + NETWORK_MANAGER_BRING_UP_CALL_LIST
+
 NETWORKD_BRING_UP_CALL_LIST: list = [
     ((["ip", "link", "set", "dev", "eth0", "up"],), {}),
     ((["ip", "link", "set", "dev", "eth1", "up"],), {}),
@@ -250,6 +260,23 @@ NETWORKD_BRING_UP_CALL_LIST: list = [
     ],
 )
 class TestActivatorsBringUp:
+    @patch("cloudinit.subp.subp", return_value=("", "Some warning condition"))
+    def test_bring_up_interface_log_level_on_stderr(
+        self, m_subp, activator, expected_call_list, available_mocks, caplog
+    ):
+        """Activator stderr logged debug for netplan and warning for others."""
+        if activator == NetplanActivator:
+            log_level = logging.DEBUG
+        else:
+            log_level = logging.WARNING
+        with caplog.at_level(log_level):
+            activator.bring_up_interface("eth0")
+        index = 0
+        for call in m_subp.call_args_list:
+            assert call == expected_call_list[index]
+            index += 1
+        assert "Received stderr output: Some warning condition" in caplog.text
+
     @patch("cloudinit.subp.subp", return_value=("", ""))
     def test_bring_up_interface(
         self, m_subp, activator, expected_call_list, available_mocks
@@ -260,7 +287,18 @@ class TestActivatorsBringUp:
             assert call == expected_call_list[index]
             index += 1
 
-    @patch("cloudinit.subp.subp", return_value=("", ""))
+
+@pytest.mark.parametrize(
+    "activator, expected_call_list",
+    [
+        (IfUpDownActivator, IF_UP_DOWN_BRING_UP_CALL_LIST),
+        (NetplanActivator, NETPLAN_CALL_LIST),
+        (NetworkManagerActivator, NETWORK_MANAGER_BRING_UP_ALL_CALL_LIST),
+        (NetworkdActivator, NETWORKD_BRING_UP_CALL_LIST),
+    ],
+)
+class TestActivatorsBringUpAll:
+    @patch("cloudinit.subp.subp", return_value=subp.SubpResult("", ""))
     def test_bring_up_interfaces(
         self, m_subp, activator, expected_call_list, available_mocks
     ):
@@ -270,7 +308,7 @@ class TestActivatorsBringUp:
             assert call == expected_call_list[index]
             index += 1
 
-    @patch("cloudinit.subp.subp", return_value=("", ""))
+    @patch("cloudinit.subp.subp", return_value=subp.SubpResult("", ""))
     def test_bring_up_all_interfaces_v1(
         self, m_subp, activator, expected_call_list, available_mocks
     ):
@@ -279,7 +317,7 @@ class TestActivatorsBringUp:
         for call in m_subp.call_args_list:
             assert call in expected_call_list
 
-    @patch("cloudinit.subp.subp", return_value=("", ""))
+    @patch("cloudinit.subp.subp", return_value=subp.SubpResult("", ""))
     def test_bring_up_all_interfaces_v2(
         self, m_subp, activator, expected_call_list, available_mocks
     ):

@@ -17,7 +17,6 @@ from cloudinit.sources.helpers import openstack
 LOG = logging.getLogger(__name__)
 
 # Various defaults/constants...
-DEF_MD_URLS = ["http://[fe80::a9fe:a9fe]", "http://169.254.169.254"]
 DEFAULT_IID = "iid-dsopenstack"
 DEFAULT_METADATA = {
     "instance-id": DEFAULT_IID,
@@ -32,10 +31,12 @@ DMI_ASSET_TAG_OPENTELEKOM = "OpenTelekomCloud"
 # -> compute.defaults.vmware.smbios_asset_tag for this value
 DMI_ASSET_TAG_SAPCCLOUD = "SAP CCloud VM"
 DMI_ASSET_TAG_HUAWEICLOUD = "HUAWEICLOUD"
+DMI_ASSET_TAG_SAMSUNGCLOUDPLATFORM = "Samsung Cloud Platform"
 VALID_DMI_ASSET_TAGS = VALID_DMI_PRODUCT_NAMES
 VALID_DMI_ASSET_TAGS += [
     DMI_ASSET_TAG_HUAWEICLOUD,
     DMI_ASSET_TAG_OPENTELEKOM,
+    DMI_ASSET_TAG_SAMSUNGCLOUDPLATFORM,
     DMI_ASSET_TAG_SAPCCLOUD,
 ]
 
@@ -73,6 +74,12 @@ class DataSourceOpenStack(openstack.SourceMixin, sources.DataSource):
         return mstr
 
     def wait_for_metadata_service(self):
+        DEF_MD_URLS = [
+            "http://[fe80::a9fe:a9fe%25{iface}]".format(
+                iface=self.distro.fallback_interface
+            ),
+            "http://169.254.169.254",
+        ]
         urls = self.ds_cfg.get("metadata_urls", DEF_MD_URLS)
         filtered = [x for x in urls if util.is_resolvable_url(x)]
         if set(filtered) != set(urls):
@@ -94,7 +101,7 @@ class DataSourceOpenStack(openstack.SourceMixin, sources.DataSource):
             url2base[md_url] = url
 
         url_params = self.get_url_params()
-        start_time = time.time()
+        start_time = time.monotonic()
         avail_url, _response = url_helper.wait_for_url(
             urls=md_urls,
             max_wait=url_params.max_wait_seconds,
@@ -107,7 +114,7 @@ class DataSourceOpenStack(openstack.SourceMixin, sources.DataSource):
             LOG.debug(
                 "Giving up on OpenStack md from %s after %s seconds",
                 md_urls,
-                int(time.time() - start_time),
+                int(time.monotonic() - start_time),
             )
 
         self.metadata_address = url2base.get(avail_url)
@@ -156,11 +163,7 @@ class DataSourceOpenStack(openstack.SourceMixin, sources.DataSource):
                 with EphemeralDHCPv4(
                     self.distro, self.distro.fallback_interface
                 ):
-                    results = util.log_time(
-                        logfunc=LOG.debug,
-                        msg="Crawl of metadata service",
-                        func=self._crawl_metadata,
-                    )
+                    results = self._crawl_metadata()
             except (NoDHCPLeaseError, sources.InvalidMetaDataException) as e:
                 util.logexc(LOG, str(e))
                 return False
@@ -221,16 +224,11 @@ class DataSourceOpenStack(openstack.SourceMixin, sources.DataSource):
         url_params = self.get_url_params()
 
         try:
-            result = util.log_time(
-                LOG.debug,
-                "Crawl of openstack metadata service",
-                read_metadata_service,
-                args=[self.metadata_address],
-                kwargs={
-                    "ssl_details": self.ssl_details,
-                    "retries": url_params.num_retries,
-                    "timeout": url_params.timeout_seconds,
-                },
+            result = read_metadata_service(
+                self.metadata_address,
+                ssl_details=self.ssl_details,
+                retries=url_params.num_retries,
+                timeout=url_params.timeout_seconds,
             )
         except openstack.NonReadable as e:
             raise sources.InvalidMetaDataException(str(e))

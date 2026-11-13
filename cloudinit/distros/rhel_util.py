@@ -20,13 +20,13 @@ LOG = logging.getLogger(__name__)
 def update_sysconfig_file(fn, adjustments, allow_empty=False):
     if not adjustments:
         return
-    (exists, contents) = read_sysconfig_file(fn)
+    exists, contents = read_sysconfig_file(fn)
     updated_am = 0
-    for (k, v) in adjustments.items():
+    for k, v in adjustments.items():
         if v is None:
             continue
         v = str(v)
-        if len(v) == 0 and not allow_empty:
+        if (not v) and (not allow_empty):
             continue
         contents[k] = v
         updated_am += 1

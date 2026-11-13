@@ -1,13 +1,17 @@
 # This file is part of cloud-init. See LICENSE file for license information.
+import tempfile
 from itertools import count, cycle
 from unittest import mock
 
 import pytest
 
-from cloudinit import subp
+from cloudinit import helpers, subp
+from cloudinit.distros.package_management import apt
 from cloudinit.distros.package_management.apt import APT_GET_COMMAND, Apt
+from tests.unittests.util import FakeDataSource
 
 M_PATH = "cloudinit.distros.package_management.apt.Apt."
+TMP_DIR = tempfile.TemporaryDirectory()
 
 
 @mock.patch.dict("os.environ", {}, clear=True)
@@ -35,7 +39,7 @@ class TestPackageCommand:
     @mock.patch("cloudinit.distros.package_management.apt.time.sleep")
     def test_wait_for_lock(self, m_sleep, m_apt_avail, m_subp, m_which):
         apt = Apt(runner=mock.Mock(), apt_get_wrapper_command=("dontcare",))
-        apt._wait_for_apt_command("stub", {"args": "stub2"})
+        apt._wait_for_apt_command({"args": "stub2"})
         assert m_sleep.call_args_list == [mock.call(1), mock.call(1)]
         assert m_subp.call_args_list == [mock.call(args="stub2")]
 
@@ -53,7 +57,7 @@ class TestPackageCommand:
     ):
         apt = Apt(runner=mock.Mock(), apt_get_wrapper_command=("dontcare",))
         with pytest.raises(TimeoutError):
-            apt._wait_for_apt_command("stub", "stub2", timeout=5)
+            apt._wait_for_apt_command({"args": "stub2"}, timeout=5)
         assert m_subp.call_args_list == []
 
     @mock.patch(
@@ -67,7 +71,7 @@ class TestPackageCommand:
             exit_code=100, stderr="Could not get apt lock"
         )
         m_subp.side_effect = [exception, exception, "return_thing"]
-        ret = apt._wait_for_apt_command("stub", {"args": "stub2"})
+        ret = apt._wait_for_apt_command({"args": "stub2"})
         assert ret == "return_thing"
 
     @mock.patch(
@@ -87,7 +91,7 @@ class TestPackageCommand:
             exit_code=100, stderr="Could not get apt lock"
         )
         with pytest.raises(TimeoutError):
-            apt._wait_for_apt_command("stub", {"args": "stub2"}, timeout=5)
+            apt._wait_for_apt_command({"args": "stub2"}, timeout=5)
 
     def test_search_stem(self, m_subp, m_which, mocker):
         """Test that containing `-`, `^`, `/`, or `=` is handled correctly."""
@@ -112,3 +116,114 @@ class TestPackageCommand:
                 "pkg5^",
             ],
         )
+
+
+@pytest.fixture(scope="function")
+def apt_paths(paths, tmpdir):
+    with mock.patch.object(
+        apt,
+        "APT_LOCK_FILES",
+        [f"{tmpdir}/{FILE}" for FILE in apt.APT_LOCK_FILES],
+    ):
+        paths.datasource = FakeDataSource()
+        yield paths
+
+
+class TestUpdatePackageSources:
+    @mock.patch.object(apt.subp, "which", return_value=True)
+    @mock.patch.object(apt.subp, "subp")
+    def test_force_update_calls_twice(self, m_subp, m_which, apt_paths):
+        """Ensure that force=true calls apt update again"""
+        instance = apt.Apt(helpers.Runners(apt_paths))
+        instance.update_package_sources()
+        instance.update_package_sources(force=True)
+        assert 2 == len(m_subp.call_args_list)
+        TMP_DIR.cleanup()
+
+    @mock.patch.object(apt.subp, "which", return_value=True)
+    @mock.patch.object(apt.subp, "subp")
+    def test_force_update_twice_calls_twice(self, m_subp, m_which, apt_paths):
+        """Ensure that force=true calls apt update again when called twice"""
+        instance = apt.Apt(helpers.Runners(apt_paths))
+        instance.update_package_sources(force=True)
+        instance.update_package_sources(force=True)
+        assert 2 == len(m_subp.call_args_list)
+        TMP_DIR.cleanup()
+
+    @mock.patch.object(apt.subp, "which", return_value=True)
+    @mock.patch.object(apt.subp, "subp")
+    def test_no_force_update_calls_once(self, m_subp, m_which, apt_paths):
+        """Ensure that apt-get update calls are deduped unless expected"""
+        instance = apt.Apt(helpers.Runners(apt_paths))
+        instance.update_package_sources()
+        instance.update_package_sources()
+        assert 1 == len(m_subp.call_args_list)
+        TMP_DIR.cleanup()
+
+
+class TestGetAllPackages:
+    @mock.patch.object(apt.subp, "which", return_value=True)
+    @mock.patch.object(apt.subp, "subp")
+    def test_joins_foreign_architecture_packages(self, m_subp, m_which):
+        """Foreign-arch packages are included in the available set."""
+
+        def fake_subp(args, **kwargs):
+            if args == ["apt-cache", "pkgnames"]:
+                return mock.Mock(stdout="amd64-only\n")
+            if args == ["dpkg", "--print-foreign-architectures"]:
+                return mock.Mock(stdout="i386\narm64\n")
+            if args == [
+                "apt-cache",
+                "-o",
+                "APT::Architecture=i386",
+                "pkgnames",
+            ]:
+                return mock.Mock(stdout="i386-only\n")
+            if args == [
+                "apt-cache",
+                "-o",
+                "APT::Architecture=arm64",
+                "pkgnames",
+            ]:
+                return mock.Mock(stdout="arm64-only\n")
+            raise AssertionError(f"unexpected args: {args}")
+
+        m_subp.side_effect = fake_subp
+        instance = apt.Apt(mock.Mock())
+        assert {
+            "amd64-only",
+            "i386-only",
+            "arm64-only",
+        } == instance.get_all_packages()
+
+    @mock.patch.object(apt.subp, "which", return_value=True)
+    @mock.patch.object(apt.subp, "subp")
+    def test_no_foreign_architectures(self, m_subp, m_which):
+        """An empty foreign-arch list leaves the primary set untouched."""
+
+        def fake_subp(args, **kwargs):
+            if args == ["apt-cache", "pkgnames"]:
+                return mock.Mock(stdout="amd64-only\n")
+            if args == ["dpkg", "--print-foreign-architectures"]:
+                return mock.Mock(stdout="")
+            raise AssertionError(f"unexpected args: {args}")
+
+        m_subp.side_effect = fake_subp
+        instance = apt.Apt(mock.Mock())
+        assert {"amd64-only"} == instance.get_all_packages()
+
+    @mock.patch.object(apt.subp, "which", return_value=True)
+    @mock.patch.object(apt.subp, "subp")
+    def test_dpkg_failure_falls_back_to_primary(self, m_subp, m_which):
+        """A dpkg query failure only yields the primary architecture."""
+
+        def fake_subp(args, **kwargs):
+            if args == ["apt-cache", "pkgnames"]:
+                return mock.Mock(stdout="amd64-only\n")
+            if args == ["dpkg", "--print-foreign-architectures"]:
+                raise subp.ProcessExecutionError(stderr="boom")
+            raise AssertionError(f"unexpected args: {args}")
+
+        m_subp.side_effect = fake_subp
+        instance = apt.Apt(mock.Mock())
+        assert {"amd64-only"} == instance.get_all_packages()

@@ -151,9 +151,11 @@ class TestStatus:
         assert details.condition_status == status.ConditionStatus.ERROR
         assert details.description == "Failed due to systemd unit failure"
         assert details.errors == [
-            "Failed due to systemd unit failure. Ensure all cloud-init "
-            "services are enabled, and check 'systemctl' or 'journalctl' "
-            "for more information."
+            (
+                "Failed due to systemd unit failure. Ensure all cloud-init "
+                "services are enabled, and check 'systemctl' or 'journalctl' "
+                "for more information."
+            )
         ]
 
     @pytest.mark.parametrize(
@@ -186,7 +188,7 @@ class TestStatus:
                 lambda config: f"Cloud-init disabled by {config.disable_file}",
                 id="true_on_disable_file",
             ),
-            # Not disabled when using systemd and enabled via commandline.
+            # Not disabled when using systemd and enabled via command line.
             pytest.param(
                 lambda config: config.disable_file,
                 True,
@@ -305,16 +307,14 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
             cmdargs,
         )
         assert retcode == 0
-        expected = dedent(
-            """\
+        expected = dedent("""\
             status: disabled
             extended_status: disabled
-            boot_status_code: disabled-by-kernel-cmdline
+            boot_status_code: disabled-by-kernel-command-line
             detail: disabled for some reason
             errors: []
             recoverable_errors: {}
-        """
-        )
+        """)
         out, _err = capsys.readouterr()
         assert out == expected
 
@@ -386,8 +386,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
                 None,
                 MyArgs(long=True, wait=False, format="tabular"),
                 0,
-                dedent(
-                    """\
+                dedent("""\
                     status: done
                     extended_status: done
                     boot_status_code: enabled-by-generator
@@ -395,8 +394,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
                     detail: DataSourceNoCloud [seed=/var/.../seed/nocloud-net][dsmode=net]
                     errors: []
                     recoverable_errors: {}
-                    """  # noqa: E501
-                ),
+                    """),  # noqa: E501
                 id="returns_done_long",
             ),
             # Reports error when any stage has errors.
@@ -448,11 +446,10 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
                 None,
                 MyArgs(long=True, wait=False, format="tabular"),
                 1,
-                dedent(
-                    """\
+                dedent("""\
                 status: error
                 extended_status: error - running
-                boot_status_code: enabled-by-kernel-cmdline
+                boot_status_code: enabled-by-kernel-command-line
                 last_update: Thu, 01 Jan 1970 00:02:05 +0000
                 detail: DataSourceNoCloud [seed=/var/.../seed/nocloud-net][dsmode=net]
                 errors:
@@ -460,8 +457,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
                 \t- error2
                 \t- error3
                 recoverable_errors: {}
-                """  # noqa: E501
-                ),
+                """),  # noqa: E501
                 id="on_errors_long",
             ),
             # Long format reports the stage in which we are running.
@@ -478,17 +474,15 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
                 None,
                 MyArgs(long=True, wait=False, format="tabular"),
                 0,
-                dedent(
-                    """\
+                dedent("""\
                     status: running
                     extended_status: running
-                    boot_status_code: enabled-by-kernel-cmdline
+                    boot_status_code: enabled-by-kernel-command-line
                     last_update: Thu, 01 Jan 1970 00:02:04 +0000
                     detail: Running in stage: init
                     errors: []
                     recoverable_errors: {}
-                    """
-                ),
+                    """),
                 id="running_long_format",
             ),
             pytest.param(
@@ -504,10 +498,9 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
                 None,
                 MyArgs(long=False, wait=False, format="yaml"),
                 0,
-                dedent(
-                    """\
+                dedent("""\
                    ---
-                   boot_status_code: enabled-by-kernel-cmdline
+                   boot_status_code: enabled-by-kernel-command-line
                    datasource: ''
                    detail: 'Running in stage: init'
                    errors: []
@@ -524,8 +517,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
                    status: running
                    ...
 
-                   """
-                ),
+                   """),
                 id="running_yaml_format",
             ),
             pytest.param(
@@ -542,7 +534,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
                 MyArgs(long=False, wait=False, format="json"),
                 0,
                 {
-                    "boot_status_code": "enabled-by-kernel-cmdline",
+                    "boot_status_code": "enabled-by-kernel-command-line",
                     "datasource": "",
                     "detail": "Running in stage: init",
                     "errors": [],
@@ -583,7 +575,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
                 MyArgs(long=False, wait=False, format="json"),
                 1,
                 {
-                    "boot_status_code": "enabled-by-kernel-cmdline",
+                    "boot_status_code": "enabled-by-kernel-command-line",
                     "datasource": "nocloud",
                     "detail": (
                         "DataSourceNoCloud [seed=/var/.../seed/"
@@ -666,7 +658,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
                 MyArgs(long=False, wait=False, format="json"),
                 2,
                 {
-                    "boot_status_code": "enabled-by-kernel-cmdline",
+                    "boot_status_code": "enabled-by-kernel-command-line",
                     "datasource": "nocloud",
                     "detail": (
                         "DataSourceNoCloud [seed=/var/.../"
@@ -746,7 +738,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
         assert_file,
         cmdargs: MyArgs,
         expected_retcode: int,
-        expected_status: str,
+        expected_status: Union[str, dict],
         config: Config,
         capsys,
     ):
@@ -827,7 +819,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
         assert retcode == 0
         assert sleep_calls == 4
         out, _err = capsys.readouterr()
-        assert out == "....\nstatus: done\n"
+        assert out == "....status: done\n"
 
     @mock.patch(M_PATH + "read_cfg_paths")
     @mock.patch(
@@ -884,7 +876,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
         assert retcode == 1
         assert sleep_calls == 4
         out, _err = capsys.readouterr()
-        assert out == "....\nstatus: error\n"
+        assert out == "....status: error\n"
 
     @mock.patch(M_PATH + "read_cfg_paths")
     @mock.patch(
@@ -936,7 +928,6 @@ class TestSystemdFailed:
             # different depending on the ActiveState they are mapped to.
             # Because of this I'm only testing SubState combinations seen
             # in real-world testing (or using "any" string if we dont care).
-            ("activating", "enabled", "start", "123", False),
             ("activating", "enabled", "start", "123", False),
             ("active", "enabled-runtime", "exited", "0", False),
             ("active", "enabled", "exited", "0", False),

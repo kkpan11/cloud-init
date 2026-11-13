@@ -11,12 +11,11 @@ import ipaddress
 import logging
 import os
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+import time
+from typing import Callable, Dict, List, Optional, Tuple
 
-from cloudinit import subp, util
+from cloudinit import performance, subp, util
 from cloudinit.net.netops.iproute2 import Iproute2
-from cloudinit.url_helper import UrlError, readurl
 
 LOG = logging.getLogger(__name__)
 SYS_CLASS_NET = "/sys/class/net/"
@@ -243,7 +242,7 @@ def get_dev_features(devname):
 
 
 def has_netfail_standby_feature(devname):
-    """ Return True if VIRTIO_NET_F_STANDBY bit (62) is set.
+    """Return True if VIRTIO_NET_F_STANDBY bit (62) is set.
 
     https://github.com/torvalds/linux/blob/ \
         089cf7f6ecb266b6a4164919a2e69bd2f938374a/ \
@@ -413,6 +412,54 @@ def find_candidate_nics() -> List[str]:
         return find_candidate_nics_on_linux()
 
 
+def wait_for_candidate_nics(
+    timeout: int = 60, sleep_interval: float = 1.0
+) -> List[str]:
+    """Poll for candidate NICs which have carrier until at least one appears
+       or timeout.
+
+    @param timeout: Maximum number of seconds to wait after initial discovery.
+    @param sleep_interval: Number of seconds to sleep between retries.
+    @return: List of candidate NICs, which may be empty on timeout.
+    """
+    with performance.Timed("Waiting for candidate NICs", log_mode="skip") as t:
+        start = time.monotonic()
+        deadline = start + timeout
+        if timeout > 0:
+            LOG.debug(
+                "Waiting for candidate NICs with carrier for up to %s "
+                "seconds",
+                timeout,
+            )
+        candidate_nics = find_candidate_nics()
+
+        while not candidate_nics and time.monotonic() < deadline:
+            LOG.debug(
+                "No primary NICs found with carrier, waiting %s "
+                "seconds to retry",
+                sleep_interval,
+            )
+            time.sleep(sleep_interval)
+            candidate_nics = find_candidate_nics()
+
+        if not candidate_nics and timeout > 0 and time.monotonic() >= deadline:
+            LOG.debug(
+                "Timed out after %s seconds waiting for primary NICs with "
+                "carrier",
+                timeout,
+            )
+
+    LOG.debug(
+        "Candidate NIC polling completed in %.3f seconds "
+        "(timeout=%s, sleep_interval=%s): %s",
+        t.delta,
+        timeout,
+        sleep_interval,
+        candidate_nics,
+    )
+    return candidate_nics
+
+
 def find_fallback_nic() -> Optional[str]:
     """Get the name of the 'fallback' network device."""
     if util.is_FreeBSD() or util.is_DragonFlyBSD():
@@ -488,8 +535,17 @@ def find_candidate_nics_on_linux() -> List[str]:
                 "Found unstable nic names: %s; calling udevadm settle",
                 unstable,
             )
-            msg = "Waiting for udev events to settle"
-            util.log_time(LOG.debug, msg, func=util.udevadm_settle)
+            try:
+                util.udevadm_settle()
+            except subp.ProcessExecutionError as error:
+                LOG.warning(
+                    "udevadm failed to settle: "
+                    "cmd=%r stderr=%r stdout=%r exit_code=%s",
+                    error.cmd,
+                    error.stderr,
+                    error.stdout,
+                    error.exit_code,
+                )
 
     # sort into interfaces with carrier, interfaces which could have carrier,
     # and ignore interfaces that are definitely disconnected
@@ -555,10 +611,8 @@ def find_fallback_nic_on_linux() -> Optional[str]:
     return None
 
 
-def generate_fallback_config(config_driver=None):
+def generate_fallback_config(config_driver=None) -> Optional[dict]:
     """Generate network cfg v2 for dhcp on the NIC most likely connected."""
-    if not config_driver:
-        config_driver = False
 
     target_name = find_fallback_nic()
     if not target_name:
@@ -572,16 +626,16 @@ def generate_fallback_config(config_driver=None):
         match = {
             "macaddress": read_sys_net_safe(target_name, "address").lower()
         }
+    if config_driver:
+        driver = device_driver(target_name)
+        if driver:
+            match["driver"] = driver
     cfg = {
         "dhcp4": True,
         "dhcp6": True,
         "set-name": target_name,
         "match": match,
     }
-    if config_driver:
-        driver = device_driver(target_name)
-        if driver:
-            cfg["match"]["driver"] = driver
     nconf = {"ethernets": {target_name: cfg}, "version": 2}
     return nconf
 
@@ -642,7 +696,7 @@ def interface_has_own_mac(ifname, strict=False):
     are bonds or vlans that inherit their mac from another device.
     Possible values are:
       0: permanent address    2: stolen from another device
-      1: randomly generated   3: set using dev_set_mac_address"""
+    1: randomly generated   3: set using dev_set_mac_address"""
 
     assign_type = read_sys_net_int(ifname, "addr_assign_type")
     if assign_type is None:
@@ -670,7 +724,7 @@ def _get_current_rename_info(check_downable=True):
          }}
     """
     cur_info = {}
-    for (name, mac, driver, device_id) in get_interfaces():
+    for name, mac, driver, device_id in get_interfaces():
         cur_info[name] = {
             "downable": None,
             "device_id": device_id,
@@ -686,7 +740,10 @@ def _get_current_rename_info(check_downable=True):
             ["ip", "-6", "addr", "show", "permanent", "scope", "global"],
             capture=True,
         )
-        ipv4, _err = subp.subp(["ip", "-4", "addr", "show"], capture=True)
+        ipv4, _err = subp.subp(
+            ["ip", "-4", "addr", "show", "permanent", "scope", "global"],
+            capture=True,
+        )
 
         nics_with_addresses = set()
         for bytes_out in (ipv6, ipv4):
@@ -722,7 +779,7 @@ def _rename_interfaces(
     LOG.debug("Detected interfaces %s", cur_info)
 
     def update_byname(bymac):
-        return dict((data["name"], data) for data in cur_info.values())
+        return dict((data["name"], data) for data in bymac.values())
 
     ops = []
     errors = []
@@ -767,7 +824,7 @@ def _rename_interfaces(
     for mac, new_name, driver, device_id in renames:
         if mac:
             mac = mac.lower()
-        cur_ops = []
+        cur_ops: list = []
         cur = find_entry(mac, driver, device_id)
         if not cur:
             if strict_present:
@@ -811,7 +868,7 @@ def _rename_interfaces(
                 else:
                     cur_ops.append(("down", mac, new_name, (new_name,)))
 
-            tmp_name = None
+            tmp_name: Optional[str] = None
             while tmp_name is None or tmp_name in cur_byname:
                 tmpi += 1
                 tmp_name = tmpname_fmt % tmpi
@@ -827,13 +884,13 @@ def _rename_interfaces(
         cur_byname = update_byname(cur_info)
         ops += cur_ops
 
-    opmap = {
+    opmap: Dict[str, Callable] = {
         "rename": Iproute2.link_rename,
         "down": Iproute2.link_down,
         "up": Iproute2.link_up,
     }
 
-    if len(ops) + len(ups) == 0:
+    if not (ops) and not (ups):
         if len(errors):
             LOG.warning(
                 "Unable to rename interfaces: %s due to errors: %s",
@@ -847,7 +904,7 @@ def _rename_interfaces(
 
         for op, mac, new_name, params in ops + ups:
             try:
-                opmap.get(op)(*params)
+                opmap[op](*params)
             except Exception as e:
                 errors.append(
                     "[unknown] Error performing %s%s for %s, %s: %s"
@@ -901,7 +958,7 @@ def find_interface_name_from_mac(mac: str) -> Optional[str]:
 
 
 def get_interfaces_by_mac_on_freebsd() -> dict:
-    (out, _) = subp.subp(["ifconfig", "-a", "ether"])
+    out, _ = subp.subp(["ifconfig", "-a", "ether"])
 
     # flatten each interface block in a single line
     def flatten(out):
@@ -934,7 +991,7 @@ def get_interfaces_by_mac_on_netbsd() -> dict:
         r"(?P<ifname>\w+).*address:\s"
         r"(?P<mac>([\da-f]{2}[:-]){5}([\da-f]{2})).*"
     )
-    (out, _) = subp.subp(["ifconfig", "-a"])
+    out, _ = subp.subp(["ifconfig", "-a"])
     if_lines = re.sub(r"\n\s+", " ", out).splitlines()
     for line in if_lines:
         m = re.match(re_field_match, line)
@@ -950,7 +1007,7 @@ def get_interfaces_by_mac_on_openbsd() -> dict:
         r"(?P<ifname>\w+).*lladdr\s"
         r"(?P<mac>([\da-f]{2}[:-]){5}([\da-f]{2})).*"
     )
-    (out, _) = subp.subp(["ifconfig", "-a"])
+    out, _ = subp.subp(["ifconfig", "-a"])
     if_lines = re.sub(r"\n\s+", " ", out).splitlines()
     for line in if_lines:
         m = re.match(re_field_match, line)
@@ -1049,8 +1106,6 @@ def get_interfaces(
     # 16 somewhat arbitrarily chosen.  Normally a mac is 6 '00:' tokens.
     zero_mac = ":".join(("00",) * 16)
     for name in devs:
-        if filter_without_own_mac and not interface_has_own_mac(name):
-            continue
         if is_bridge(name):
             filtered_logger("Ignoring bridge interface: %s", name)
             continue
@@ -1058,6 +1113,9 @@ def get_interfaces(
             continue
         if is_bond(name):
             filtered_logger("Ignoring bond interface: %s", name)
+            continue
+        if filter_without_own_mac and not interface_has_own_mac(name):
+            filtered_logger("Ignoring interface with inherited MAC: %s", name)
             continue
         if (
             filter_slave_if_master_not_bridge_bond_openvswitch
@@ -1136,7 +1194,7 @@ def filter_hyperv_vf_with_synthetic_interface(
 def get_ib_hwaddrs_by_interface():
     """Build a dictionary mapping Infiniband interface names to their hardware
     address."""
-    ret = {}
+    ret: Dict[str, str] = {}
     for name, _, _, _ in get_interfaces():
         ib_mac = get_ib_interface_hwaddr(name, False)
         if ib_mac:
@@ -1147,45 +1205,6 @@ def get_ib_hwaddrs_by_interface():
                 )
             ret[name] = ib_mac
     return ret
-
-
-def has_url_connectivity(url_data: Dict[str, Any]) -> bool:
-    """Return true when the instance has access to the provided URL.
-
-    Logs a warning if url is not the expected format.
-
-    url_data is a dictionary of kwargs to send to readurl. E.g.:
-
-    has_url_connectivity({
-        "url": "http://example.invalid",
-        "headers": {"some": "header"},
-        "timeout": 10
-    })
-    """
-    if "url" not in url_data:
-        LOG.warning(
-            "Ignoring connectivity check. No 'url' to check in %s", url_data
-        )
-        return False
-    url = url_data["url"]
-    try:
-        result = urlparse(url)
-        if not any([result.scheme == "http", result.scheme == "https"]):
-            LOG.warning(
-                "Ignoring connectivity check. Invalid URL scheme %s",
-                url.scheme,
-            )
-            return False
-    except ValueError as err:
-        LOG.warning("Ignoring connectivity check. Invalid URL %s", err)
-        return False
-    if "timeout" not in url_data:
-        url_data["timeout"] = 5
-    try:
-        readurl(**url_data)
-    except UrlError:
-        return False
-    return True
 
 
 def maybe_get_address(convert_to_address: Callable, address: str, **kwargs):

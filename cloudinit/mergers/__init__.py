@@ -8,8 +8,6 @@ import re
 
 from cloudinit import importer, type_utils
 
-NAME_MTCH = re.compile(r"(^[a-zA-Z_][A-Za-z0-9_]*)\((.*?)\)$")
-
 DEF_MERGE_TYPE = "list()+dict()+str()"
 MERGER_PREFIX = "m_"
 MERGER_ATTR = "Merger"
@@ -28,7 +26,7 @@ class UnknownMerger:
     # object and a object to merge_with.
     #
     # If not found the merge will be given to a '_handle_unknown'
-    # function which can decide what to do wit the 2 values.
+    # function which can decide what to do with the 2 values.
     def merge(self, source, merge_with):
         type_name = type_utils.obj_name(source)
         type_name = type_name.lower()
@@ -75,7 +73,7 @@ class LookupMerger(UnknownMerger):
 
 
 def dict_extract_mergers(config):
-    parsed_mergers = []
+    parsed_mergers: list = []
     raw_mergers = config.pop("merge_how", None)
     if raw_mergers is None:
         raw_mergers = config.pop("merge_type", None)
@@ -108,13 +106,13 @@ def string_extract_mergers(merge_how):
         m_name = m_name.replace("-", "_")
         if not m_name:
             continue
-        match = NAME_MTCH.match(m_name)
+        match = re.match(r"(^[a-zA-Z_][A-Za-z0-9_]*)\((.*?)\)$", m_name)
         if not match:
             msg = "Matcher identifier '%s' is not in the right format" % (
                 m_name
             )
             raise ValueError(msg)
-        (m_name, m_ops) = match.groups()
+        m_name, m_ops = match.groups()
         m_ops = m_ops.strip().split(",")
         m_ops = [m.strip().lower() for m in m_ops if m.strip()]
         parsed_mergers.append((m_name, m_ops))
@@ -127,7 +125,7 @@ def default_mergers():
 
 def construct(parsed_mergers):
     mergers_to_be = []
-    for (m_name, m_ops) in parsed_mergers:
+    for m_name, m_ops in parsed_mergers:
         if not m_name.startswith(MERGER_PREFIX):
             m_name = MERGER_PREFIX + str(m_name)
         merger_locs, looked_locs = importer.find_module(
@@ -145,8 +143,8 @@ def construct(parsed_mergers):
             mod_attr = getattr(mod, MERGER_ATTR)
             mergers_to_be.append((mod_attr, m_ops))
     # Now form them...
-    mergers = []
+    mergers: list = []
     root = LookupMerger(mergers)
-    for (attr, opts) in mergers_to_be:
+    for attr, opts in mergers_to_be:
         mergers.append(attr(root, opts))
     return root

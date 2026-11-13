@@ -36,7 +36,7 @@ users:
   - name: newsuper
     gecos: Big Stuff
     groups: users, admin
-    sudo: ALL=(ALL) NOPASSWD:ALL
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
     hashed-password: asdfasdf
     shell: /bin/bash
     lock_passwd: true
@@ -51,7 +51,11 @@ class TestValidUserData:
         PR #575
         """
         result = class_client.execute("cloud-init schema --system")
-        assert result.ok
+        if PLATFORM == "ibm":
+            assert "Invalid schema: vendor-data" in result.stderr
+            assert not result.ok
+        else:
+            assert result.ok
         assert "Valid schema user-data" in result.stdout.strip()
         result = class_client.execute("cloud-init status --long")
         assert 0 == result.return_code, (
@@ -108,8 +112,8 @@ def test_invalid_userdata_schema(client: IntegrationInstance):
     ), f"Unexpected exit code {result.return_code}"
     log = client.read_from_file("/var/log/cloud-init.log")
     warning = (
-        "[WARNING]: Invalid cloud-config provided: Please run "
-        "'sudo cloud-init schema --system' to see the schema errors."
+        "[WARNING]: cloud-config failed schema validation! "
+        "You may run 'sudo cloud-init schema --system' to check the details."
     )
     assert warning in log
     assert "asdfasdf" not in log
@@ -117,8 +121,18 @@ def test_invalid_userdata_schema(client: IntegrationInstance):
 
 @pytest.mark.user_data(FAILING_USER_DATA)
 def test_failing_userdata_modules_exit_codes(client: IntegrationInstance):
-    """Test failing in modules representd in exit status"""
+    """Test failing in modules represented in exit status.
+
+    To ensure we don't miss any errors or warnings if a service happens
+    to be restarted, any further module invocations will exit with error
+    on the same boot if a previous invocation exited with error.
+
+    In this test, both bootcmd and runcmd will exit with error the first time.
+    The second time, runcmd will run cleanly, but still exit with error.
+    Since bootcmd runs in init timeframe, and runcmd runs in final timeframe,
+    expect error from those two modes.
+    """
     for mode in ("init", "config", "final"):
         result = client.execute(f"cloud-init modules --mode {mode}")
-        assert result.failed if mode == "init" else result.ok
+        assert result.ok if mode == "config" else result.failed
         assert f"'modules:{mode}'" in result.stdout.strip()

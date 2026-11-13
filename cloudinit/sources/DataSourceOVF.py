@@ -52,12 +52,12 @@ class DataSourceOVF(sources.DataSource):
             "instance-id": "iid-dsovf",
         }
 
-        (seedfile, contents) = get_ovf_env(self.paths.seed_dir)
+        seedfile, contents = get_ovf_env(self.paths.seed_dir)
 
         if seedfile:
             # Found a seed dir
             seed = os.path.join(self.paths.seed_dir, seedfile)
-            (md, ud, cfg) = read_ovf_environment(contents)
+            md, ud, cfg = read_ovf_environment(contents)
             self.environment = contents
             found.append(seed)
         else:
@@ -71,14 +71,14 @@ class DataSourceOVF(sources.DataSource):
                 if contents:
                     break
             if contents:
-                (md, ud, cfg) = read_ovf_environment(contents, True)
+                md, ud, cfg = read_ovf_environment(contents, True)
                 self.environment = contents
                 if "network-config" in md and md["network-config"]:
                     self._network_config = md["network-config"]
                 found.append(name)
 
         # There was no OVF transports found
-        if len(found) == 0:
+        if not found:
             return False
 
         if "seedfrom" in md and md["seedfrom"]:
@@ -92,7 +92,7 @@ class DataSourceOVF(sources.DataSource):
                 LOG.debug("Seed from %s not supported by %s", seedfrom, self)
                 return False
 
-            (md_seed, ud, vd) = util.read_seeded(seedfrom, timeout=None)
+            md_seed, ud, vd, _ = util.read_seeded(seedfrom, timeout=None)
             LOG.debug("Using seeded cache data from %s", seedfrom)
 
             md = util.mergemanydict([md, md_seed])
@@ -235,7 +235,7 @@ def transport_iso9660(require_iso=True):
         if not maybe_cdrom_device(dev):
             continue
         mp = info["mountpoint"]
-        (_fname, contents) = get_ovf_env(mp)
+        _fname, contents = get_ovf_env(mp)
         if contents is not False:
             return contents
 
@@ -252,7 +252,7 @@ def transport_iso9660(require_iso=True):
     ]
     for dev in devs:
         try:
-            (_fname, contents) = util.mount_cb(dev, get_ovf_env, mtype=mtype)
+            _fname, contents = util.mount_cb(dev, get_ovf_env, mtype=mtype)
         except util.MountFailedError:
             LOG.debug("%s not mountable as iso9660", dev)
             continue
@@ -265,13 +265,13 @@ def transport_iso9660(require_iso=True):
 
 def exec_vmware_rpctool(rpctool, arg):
     cmd = [rpctool, arg]
-    (stdout, stderr) = subp.subp(cmd)
+    stdout, stderr = subp.subp(cmd)
     return (cmd, stdout, stderr)
 
 
 def exec_vmtoolsd(rpctool, arg):
     cmd = [rpctool, "--cmd", arg]
-    (stdout, stderr) = subp.subp(cmd)
+    stdout, stderr = subp.subp(cmd)
     return (cmd, stdout, stderr)
 
 
@@ -322,10 +322,11 @@ def transport_vmware_guestinfo():
         # If the first attempt at getting the data was with vmtoolsd, then
         # no second attempt is made.
         if vmtoolsd and rpctool == vmtoolsd:
-            # The fallback failed, log the error.
-            util.logexc(
-                LOG, "vmtoolsd failed to get guestinfo.ovfEnv: %s", error
-            )
+            # The fallback failed and exit code is not 1, log the error.
+            if error.exit_code != 1:
+                util.logexc(
+                    LOG, "vmtoolsd failed to get guestinfo.ovfEnv: %s", error
+                )
             return None
 
         if not vmtoolsd:
@@ -336,10 +337,11 @@ def transport_vmware_guestinfo():
             LOG.info("fallback to vmtoolsd")
             return query_guestinfo(vmtoolsd, exec_vmtoolsd)
         except subp.ProcessExecutionError as error:
-            # The fallback failed, log the error.
-            util.logexc(
-                LOG, "vmtoolsd failed to get guestinfo.ovfEnv: %s", error
-            )
+            # The fallback failed and exit code is not 1, log the error.
+            if error.exit_code != 1:
+                util.logexc(
+                    LOG, "vmtoolsd failed to get guestinfo.ovfEnv: %s", error
+                )
 
     return None
 
@@ -370,7 +372,7 @@ def get_properties(contents):
         dom.documentElement, lambda n: n.localName == "PropertySection"
     )
 
-    if len(propSections) == 0:
+    if not propSections:
         raise XmlError("No 'PropertySection's")
 
     props = {}

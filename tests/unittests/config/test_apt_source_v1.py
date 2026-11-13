@@ -1,10 +1,11 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
-""" test_handler_apt_source_v1
+"""test_handler_apt_source_v1
 Testing various config variations of the apt_source config
 This calls all things with v1 format to stress the conversion code on top of
 the actually tested code.
 """
+
 import os
 import pathlib
 import re
@@ -42,7 +43,7 @@ ADD_APT_REPO_MATCH = r"^[\w-]+:\w"
 class FakeDistro:
     """Fake Distro helper object"""
 
-    def update_package_sources(self):
+    def update_package_sources(self, *, force=False):
         """Fake update_package_sources helper method"""
         return
 
@@ -577,15 +578,13 @@ class TestAptSourceConfig:
         cfg = {"keyid": "03683F77", "filename": apt_lists[0]}
         cfg = self.wrapv1conf([cfg])
         m_gpg.getkeybyid = mock.Mock(return_value="fakekey 1212")
-        SAMPLE_GPG_AGENT_DIRMNGR_PIDS = dedent(
-            """\
+        SAMPLE_GPG_AGENT_DIRMNGR_PIDS = dedent("""\
            PPID     PID
               1    1057
               1    1095
            1511    2493
            1511    2509
-           """
-        )
+           """)
         with mock.patch.object(
             subp,
             "subp",

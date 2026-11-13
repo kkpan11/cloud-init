@@ -1,13 +1,13 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 """Install hotplug udev rules if supported and enabled"""
+
 import logging
 import os
-from textwrap import dedent
 
 from cloudinit import stages, subp, util
 from cloudinit.cloud import Cloud
 from cloudinit.config import Config
-from cloudinit.config.schema import MetaSchema, get_meta_doc
+from cloudinit.config.schema import MetaSchema
 from cloudinit.distros import ALL_DISTROS
 from cloudinit.event import EventScope, EventType
 from cloudinit.settings import PER_INSTANCE
@@ -15,48 +15,11 @@ from cloudinit.sources import DataSource
 
 meta: MetaSchema = {
     "id": "cc_install_hotplug",
-    "name": "Install Hotplug",
-    "title": "Install hotplug udev rules if supported and enabled",
-    "description": dedent(
-        """\
-        This module will install the udev rules to enable hotplug if
-        supported by the datasource and enabled in the userdata. The udev
-        rules will be installed as
-        ``/etc/udev/rules.d/90-cloud-init-hook-hotplug.rules``.
-
-        When hotplug is enabled, newly added network devices will be added
-        to the system by cloud-init. After udev detects the event,
-        cloud-init will refresh the instance metadata from the datasource,
-        detect the device in the updated metadata, then apply the updated
-        network configuration.
-
-        Currently supported datasources: Openstack, EC2
-    """
-    ),
     "distros": [ALL_DISTROS],
     "frequency": PER_INSTANCE,
-    "examples": [
-        dedent(
-            """\
-            # Enable hotplug of network devices
-            updates:
-              network:
-                when: ["hotplug"]
-        """
-        ),
-        dedent(
-            """\
-            # Enable network hotplug alongside boot event
-            updates:
-              network:
-                when: ["boot", "hotplug"]
-        """
-        ),
-    ],
     "activate_by_schema_keys": [],
 }
 
-__doc__ = get_meta_doc(meta)
 LOG = logging.getLogger(__name__)
 
 
@@ -65,7 +28,7 @@ LOG = logging.getLogger(__name__)
 HOTPLUG_UDEV_PATH = "/etc/udev/rules.d/90-cloud-init-hook-hotplug.rules"
 HOTPLUG_UDEV_RULES_TEMPLATE = """\
 # Installed by cloud-init due to network hotplug userdata
-ACTION!="add|remove", GOTO="cloudinit_end"{extra_rules}
+ACTION!="add", GOTO="cloudinit_end"{extra_rules}
 LABEL="cloudinit_hook"
 SUBSYSTEM=="net", RUN+="{libexecdir}/hook-hotplug"
 LABEL="cloudinit_end"

@@ -13,9 +13,9 @@ import logging
 import re
 from copy import copy, deepcopy
 from ipaddress import IPv4Network
-from typing import Dict, List, Union
+from typing import Dict, List, TypedDict
 
-from cloudinit import subp, util
+from cloudinit import lifecycle, subp, util
 from cloudinit.net.network_state import net_prefix_to_ipv4_mask
 from cloudinit.simpletable import SimpleTable
 
@@ -39,6 +39,13 @@ LOG = logging.getLogger(__name__)
 #         'ipv6': [{'ip': '::1/128', 'scope6': 'host'}],
 #         'up': True}}
 DEFAULT_NETDEV_INFO = {"ipv4": [], "ipv6": [], "hwaddr": "", "up": False}
+
+
+class Interface(TypedDict):
+    up: bool
+    hwaddr: str
+    ipv4: List[dict]
+    ipv6: List[dict]
 
 
 def _netdev_info_iproute_json(ipaddr_json):
@@ -95,7 +102,7 @@ def _netdev_info_iproute_json(ipaddr_json):
     return devs
 
 
-@util.deprecate_call(
+@lifecycle.deprecate_call(
     deprecated_version="22.1",
     extra_message="Required by old iproute2 versions that don't "
     "support ip json output. Consider upgrading to a more recent version.",
@@ -182,7 +189,7 @@ def _netdev_info_ifconfig_netbsd(ifconfig_data):
     # fields that need to be returned in devs for each dev
     devs = {}
     for line in ifconfig_data.splitlines():
-        if len(line) == 0:
+        if not line:
             continue
         if line[0] not in ("\t", " "):
             curdev = line.split()[0]
@@ -230,7 +237,7 @@ def _netdev_info_ifconfig(ifconfig_data):
     # fields that need to be returned in devs for each dev
     devs = {}
     for line in ifconfig_data.splitlines():
-        if len(line) == 0:
+        if not line:
             continue
         if line[0] not in ("\t", " "):
             curdev = line.split()[0]
@@ -285,7 +292,7 @@ def _netdev_info_ifconfig(ifconfig_data):
 
 def netdev_info(
     empty="",
-) -> Dict[str, Dict[str, Union[str, List[Dict[str, str]]]]]:
+) -> Dict[str, Interface]:
     """return the instance's interfaces and interface data
 
     includes, interface name, link state, hardware address, and lists of ipv4
@@ -324,20 +331,20 @@ def netdev_info(
     """
     devs = {}
     if util.is_NetBSD():
-        (ifcfg_out, _err) = subp.subp(["ifconfig", "-a"], rcs=[0, 1])
+        ifcfg_out, _err = subp.subp(["ifconfig", "-a"], rcs=[0, 1])
         devs = _netdev_info_ifconfig_netbsd(ifcfg_out)
     elif subp.which("ip"):
         # Try iproute first of all
         try:
-            (ipaddr_out, _err) = subp.subp(["ip", "--json", "addr"])
+            ipaddr_out, _err = subp.subp(["ip", "--json", "addr"])
             devs = _netdev_info_iproute_json(ipaddr_out)
         except subp.ProcessExecutionError:
             # Can be removed when "ip --json" is available everywhere
-            (ipaddr_out, _err) = subp.subp(["ip", "addr", "show"])
+            ipaddr_out, _err = subp.subp(["ip", "addr", "show"])
             devs = _netdev_info_iproute(ipaddr_out)
     elif subp.which("ifconfig"):
         # Fall back to net-tools if iproute2 is not present
-        (ifcfg_out, _err) = subp.subp(["ifconfig", "-a"], rcs=[0, 1])
+        ifcfg_out, _err = subp.subp(["ifconfig", "-a"], rcs=[0, 1])
         devs = _netdev_info_ifconfig(ifcfg_out)
     else:
         LOG.warning(
@@ -403,7 +410,7 @@ def _netdev_route_info_iproute(iproute_data):
             entry["genmask"] = "0.0.0.0"
         else:
             if "/" in toks[0]:
-                (addr, cidr) = toks[0].split("/")
+                addr, cidr = toks[0].split("/")
             else:
                 addr = toks[0]
                 cidr = "32"
@@ -423,7 +430,7 @@ def _netdev_route_info_iproute(iproute_data):
         entry["flags"] = "".join(flags)
         routes["ipv4"].append(entry)
     try:
-        (iproute_data6, _err6) = subp.subp(
+        iproute_data6, _err6 = subp.subp(
             ["ip", "--oneline", "-6", "route", "list", "table", "all"],
             rcs=[0, 1],
         )
@@ -501,7 +508,7 @@ def _netdev_route_info_netstat(route_data):
         routes["ipv4"].append(entry)
 
     try:
-        (route_data6, _err6) = subp.subp(
+        route_data6, _err6 = subp.subp(
             ["netstat", "-A", "inet6", "--route", "--numeric"], rcs=[0, 1]
         )
     except subp.ProcessExecutionError:
@@ -546,11 +553,11 @@ def route_info():
     routes = {}
     if subp.which("ip"):
         # Try iproute first of all
-        (iproute_out, _err) = subp.subp(["ip", "-o", "route", "list"])
+        iproute_out, _err = subp.subp(["ip", "-o", "route", "list"])
         routes = _netdev_route_info_iproute(iproute_out)
     elif subp.which("netstat"):
         # Fall back to net-tools if iproute2 is not present
-        (route_out, _err) = subp.subp(
+        route_out, _err = subp.subp(
             ["netstat", "--route", "--numeric", "--extend"], rcs=[0, 1]
         )
         routes = _netdev_route_info_netstat(route_out)
@@ -579,8 +586,9 @@ def netdev_pformat():
             return "\n"
         fields = ["Device", "Up", "Address", "Mask", "Scope", "Hw-Address"]
         tbl = SimpleTable(fields)
-        for (dev, data) in sorted(netdev.items()):
-            for addr in data.get("ipv4"):
+        for dev, data in sorted(netdev.items()):
+            ipv4_addrs = data.get("ipv4")
+            for addr in ipv4_addrs:
                 tbl.add_row(
                     (
                         dev,
@@ -591,7 +599,9 @@ def netdev_pformat():
                         data["hwaddr"],
                     )
                 )
-            for addr in data.get("ipv6"):
+
+            ipv6_addrs = data.get("ipv6")
+            for addr in ipv6_addrs:
                 tbl.add_row(
                     (
                         dev,
@@ -602,7 +612,7 @@ def netdev_pformat():
                         data["hwaddr"],
                     )
                 )
-            if len(data.get("ipv6")) + len(data.get("ipv4")) == 0:
+            if not (ipv4_addrs) and not (ipv6_addrs):
                 tbl.add_row(
                     (dev, data["up"], empty, empty, empty, data["hwaddr"])
                 )
@@ -635,7 +645,7 @@ def route_pformat():
                 "Flags",
             ]
             tbl_v4 = SimpleTable(fields_v4)
-            for (n, r) in enumerate(routes.get("ipv4")):
+            for n, r in enumerate(routes.get("ipv4")):
                 route_id = str(n)
                 try:
                     tbl_v4.add_row(
@@ -663,7 +673,7 @@ def route_pformat():
                 "Flags",
             ]
             tbl_v6 = SimpleTable(fields_v6)
-            for (n, r) in enumerate(routes.get("ipv6")):
+            for n, r in enumerate(routes.get("ipv6")):
                 route_id = str(n)
                 if r["iface"] == "lo":
                     continue

@@ -10,9 +10,10 @@ import re
 
 import pytest
 
+from cloudinit.subp import subp
 from tests.integration_tests.clouds import IntegrationCloud
 from tests.integration_tests.releases import CURRENT_RELEASE, IS_UBUNTU
-from tests.integration_tests.util import verify_clean_log
+from tests.integration_tests.util import verify_clean_boot, verify_clean_log
 
 USER_DATA = """\
 #cloud-config
@@ -65,7 +66,7 @@ class TestPackageUpdateUpgradeInstall:
             "grep ^Commandline: /var/log/apt/history.log"
         )
         assert re.search(
-            "Commandline: /usr/bin/apt-get --option=Dpkg::Options"
+            "Commandline: (/usr/bin/)?apt-get --option=Dpkg::Options"
             "::=--force-confold --option=Dpkg::options::=--force-unsafe-io "
             r"--assume-yes --quiet install (sl|tree) (tree|sl)",
             out,
@@ -86,14 +87,40 @@ class TestPackageUpdateUpgradeInstall:
         assert "curl" in output
         assert "postman" in output
 
+    def test_snap_refresh_not_called_when_refresh_hold_forever(
+        self, class_client
+    ):
+        """Assert snap refresh is not called when snap refresh --hold is set.
 
-HELLO_VERSIONS_BY_RELEASE = {
-    "noble": "2.10-3build1",
-    "mantic": "2.10-3",
-    "lunar": "2.10-3",
-    "jammy": "2.10-2ubuntu4",
-    "focal": "2.10-2ubuntu2",
-}
+        Certain network-limited or secure environments may opt to avoid
+        contacting snap API endpoints. In those scenarios, it is expected
+        that automated snap refresh is held for all snaps. Typically, this is
+        done with snap refresh --hold in those environments.
+
+        Assert cloud-init does not attempt to call snap refresh when
+        refresh.hold is forever.
+        """
+        assert class_client.execute(
+            [
+                "grep",
+                r"Running command \['snap', 'refresh'",
+                "/var/log/cloud-init.log",
+            ]
+        ).ok
+        assert class_client.execute("snap refresh --hold").ok
+        class_client.instance.clean()
+        class_client.restart()
+        assert class_client.execute(
+            [
+                "grep",
+                r"Running command \['snap', 'refresh']",
+                "/var/log/cloud-init.log",
+            ]
+        ).failed
+        assert class_client.execute(
+            "grep 'Skipping snap refresh' /var/log/cloud-init.log"
+        ).ok
+
 
 VERSIONED_USER_DATA = """\
 #cloud-config
@@ -104,16 +131,12 @@ packages:
 
 @pytest.mark.skipif(not IS_UBUNTU, reason="Uses Apt")
 def test_versioned_packages_are_installed(session_cloud: IntegrationCloud):
-    pkg_version = HELLO_VERSIONS_BY_RELEASE.get(
-        CURRENT_RELEASE.series, "2.10-3build1"
-    )
+    pkg_version = subp(
+        ["rmadison", f"--suite={CURRENT_RELEASE.series}", "hello"]
+    ).stdout.split()[2]
     with session_cloud.launch(
         user_data=VERSIONED_USER_DATA.format(pkg_version=pkg_version)
     ) as client:
         verify_clean_log(client.read_from_file("/var/log/cloud-init.log"))
-        assert f"hello	{pkg_version}" == client.execute(
-            "dpkg-query -W hello"
-        ), (
-            "If this is failing for a new release, add it to "
-            "HELLO_VERSIONS_BY_RELEASE"
-        )
+        verify_clean_boot(client)
+        assert f"hello	{pkg_version}" == client.execute("dpkg-query -W hello")

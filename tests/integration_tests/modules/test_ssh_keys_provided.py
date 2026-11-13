@@ -8,6 +8,7 @@ system.
 ``tests/cloud_tests/testcases/modules/ssh_keys_provided.yaml''``.)"""
 
 import pytest
+import yaml
 
 from tests.integration_tests.releases import CURRENT_RELEASE
 
@@ -16,6 +17,7 @@ USER_DATA = """\
 disable_root: false
 ssh_authorized_keys:
   - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDXW9Gg5H7ehjdSc6qDzwNtgCy94XYHhEYlXZMO2+FJrH3wfHGiMfCwOHxcOMt2QiXItULthdeQWS9QjBSSjVRXf6731igFrqPFyS9qBlOQ5D29C4HBXFnQggGVpBNJ82IRJv7szbbe/vpgLBP4kttUza9Dr4e1YM1ln4PRnjfXea6T0m+m1ixNb5432pTXlqYOnNOxSIm1gHgMLxPuDrJvQERDKrSiKSjIdyC9Jd8t2e1tkNLY0stmckVRbhShmcJvlyofHWbc2Ca1mmtP7MlS1VQnfLkvU1IrFwkmaQmaggX6WR6coRJ6XFXdWcq/AI2K6GjSnl1dnnCxE8VCEXBlXgFzad+PMSG4yiL5j8Oo1ZVpkTdgBnw4okGqTYCXyZg6X00As9IBNQfZMFlQXlIo4FiWgj3CO5QHQOyOX6FuEumaU13GnERrSSdp9tCs1Qm3/DG2RSCQBWTfcgMcStIvKqvJ3IjFn0vGLvI3Ampnq9q1SHwmmzAPSdzcMA76HyMUA5VWaBvWHlUxzIM6unxZASnwvuCzpywSEB5J2OF+p6H+cStJwQ32XwmOG8pLp1srlVWpqZI58Du/lzrkPqONphoZx0LDV86w7RUz1ksDzAdcm0tvmNRFMN1a0frDs506oA3aWK0oDk4Nmvk8sXGTYYw3iQSkOvDUUlIsqdaO+w==
+  - no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA1J77+CrJ8p6/vWCEzuylqJNMHUP/XmeYyGVWb8lnDd root@test-with-options
 ssh_keys:
   rsa_private: |
     -----BEGIN RSA PRIVATE KEY-----
@@ -75,38 +77,52 @@ class TestSshKeysProvided:
         (
             (
                 "/etc/ssh/ssh_host_rsa_key.pub",
-                "AAAAB3NzaC1yc2EAAAADAQABAAABAQC0/Ho+o3eJISydO2JvIgT"
-                "LnZOtrxPl+fSvJfKDjoOLY0HB2eOjy2s2/2N6d9X9SGZ4",
+                (
+                    "AAAAB3NzaC1yc2EAAAADAQABAAABAQC0/Ho+o3eJISydO2JvIgT"
+                    "LnZOtrxPl+fSvJfKDjoOLY0HB2eOjy2s2/2N6d9X9SGZ4"
+                ),
             ),
             (
                 "/etc/ssh/ssh_host_rsa_key",
-                "4DOkqNiUGl80Zp1RgZNohHUXlJMtAbrIlAVEk+mTmg7vjfyp2un"
-                "RQvLZpMRdywBm",
+                (
+                    "4DOkqNiUGl80Zp1RgZNohHUXlJMtAbrIlAVEk+mTmg7vjfyp2un"
+                    "RQvLZpMRdywBm"
+                ),
             ),
             (
                 "/etc/ssh/ssh_host_rsa_key-cert.pub",
-                "AAAAHHNzaC1yc2EtY2VydC12MDFAb3BlbnNzaC5jb20AAAAgMpg"
-                "BP4Phn3L8I7Vqh7lmHKcOfIokEvSEbHDw83Y3JloAAAAD",
+                (
+                    "AAAAHHNzaC1yc2EtY2VydC12MDFAb3BlbnNzaC5jb20AAAAgMpg"
+                    "BP4Phn3L8I7Vqh7lmHKcOfIokEvSEbHDw83Y3JloAAAAD"
+                ),
             ),
             (
                 "/etc/ssh/ssh_host_ecdsa_key.pub",
-                "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAAB"
-                "BBFsS5Tvky/IC/dXhE/afxxU",
+                (
+                    "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAAB"
+                    "BBFsS5Tvky/IC/dXhE/afxxU"
+                ),
             ),
             (
                 "/etc/ssh/ssh_host_ecdsa_key",
-                "AwEHoUQDQgAEWxLlO+TL8gL91eET9p/HFQbqR1A691AkJgZk3jY"
-                "5mpZqxgX4vcgb",
+                (
+                    "AwEHoUQDQgAEWxLlO+TL8gL91eET9p/HFQbqR1A691AkJgZk3jY"
+                    "5mpZqxgX4vcgb"
+                ),
             ),
             (
                 "/etc/ssh/ssh_host_ed25519_key.pub",
-                "AAAAC3NzaC1lZDI1NTE5AAAAINudAZSu4vjZpVWzId5pXmZg1M6"
-                "G15dqjQ2XkNVOEnb5",
+                (
+                    "AAAAC3NzaC1lZDI1NTE5AAAAINudAZSu4vjZpVWzId5pXmZg1M6"
+                    "G15dqjQ2XkNVOEnb5"
+                ),
             ),
             (
                 "/etc/ssh/ssh_host_ed25519_key",
-                "XAAAAAtzc2gtZWQyNTUxOQAAACDbnQGUruL42aVVsyHeaV5mYNT"
-                "OhteXao0Nl5DVThJ2+Q",
+                (
+                    "XAAAAAtzc2gtZWQyNTUxOQAAACDbnQGUruL42aVVsyHeaV5mYNT"
+                    "OhteXao0Nl5DVThJ2+Q"
+                ),
             ),
         ),
     )
@@ -126,3 +142,15 @@ class TestSshKeysProvided:
         sshd_config = class_client.read_from_file(sshd_config_path).strip()
         for expected_cert in expected_certs:
             assert expected_cert in sshd_config
+
+    def test_authorized_keys_with_options(self, class_client):
+        """Test that SSH authorized key with options is properly persisted."""
+        authorized_keys = (
+            class_client.read_from_file("/root/.ssh/authorized_keys")
+            .strip()
+            .splitlines()
+        )
+
+        # Check that the keys with SSH options are present and enabled
+        for userdata_key in yaml.safe_load(USER_DATA)["ssh_authorized_keys"]:
+            assert userdata_key in authorized_keys

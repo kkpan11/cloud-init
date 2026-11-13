@@ -28,6 +28,7 @@ CFG_BUILTIN = {
         "DigitalOcean",
         "Azure",
         "AltCloud",
+        "VMware",
         "OVF",
         "MAAS",
         "GCE",
@@ -46,10 +47,10 @@ CFG_BUILTIN = {
         "Exoscale",
         "RbxCloud",
         "UpCloud",
-        "VMware",
         "NWCS",
         "Akamai",
         "WSL",
+        "CloudCIX",
         # At the end to act as a 'catch' when none of the above work...
         "None",
     ],
@@ -59,6 +60,7 @@ CFG_BUILTIN = {
     "system_info": {
         "paths": {
             "cloud_dir": "/var/lib/cloud",
+            "docs_dir": "/usr/share/doc/cloud-init/",
             "templates_dir": "/etc/cloud/templates/",
         },
         "distro": "ubuntu",

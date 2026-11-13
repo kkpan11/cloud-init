@@ -145,11 +145,13 @@ class NMConnection:
             "dhcp": "auto",
         }
 
-        # Ensure we got an [ipvX] section
-        self._set_default(family, "method", "disabled")
+        # Ensure we have an [ipvX] section, default to disabled
+        method = "disabled"
+        self._set_default(family, "method", method)
 
         try:
-            method = method_map[subnet_type]
+            if subnet_type:
+                method = method_map[subnet_type]
         except KeyError:
             # What else can we do
             method = "auto"
@@ -171,6 +173,20 @@ class NMConnection:
             self._set_default("ipv4", "method", "disabled")
 
         self.config[family]["method"] = method
+
+        # Network Manager sets the value of `may-fail` to `True` by default.
+        # Please see https://www.networkmanager.dev/docs/api/1.32.10/settings-ipv6.html.
+        # Therefore, when no configuration for ipv4 or ipv6 is specified,
+        # `may-fail = True` applies. When the user explicitly configures ipv4
+        # or ipv6, `may-fail` is set to `False`. This is so because it is
+        # assumed that a network failure with the user provided configuration
+        # is unexpected. In other words, we think that the user knows what
+        # works in their target environment and what does not and they have
+        # correctly configured cloud-init network configuration such that
+        # it works in that environment. When no such configuration is
+        # specified, we do not know what would work and what would not in
+        # user's environment. Therefore, we are more conservative in assuming
+        # that failure with ipv4 or ipv6 can be expected or tolerated.
         self._set_default(family, "may-fail", "false")
 
     def _get_next_numbered_section(self, section, key_prefix) -> str:
@@ -221,6 +237,10 @@ class NMConnection:
         value = subnet["address"] + "/" + str(subnet["prefix"])
         self._add_numbered(family, "address", value)
 
+    def _is_default_route(self, route):
+        default_nets = ("::", "0.0.0.0")
+        return route["prefix"] == 0 and route["network"] in default_nets
+
     def _add_route(self, route):
         """Adds a ipv[46].route<n> property."""
         # Because network v2 route definitions can have mixed v4 and v6
@@ -229,6 +249,11 @@ class NMConnection:
         value = f'{route["network"]}/{route["prefix"]}'
         if "gateway" in route:
             value += f',{route["gateway"]}'
+        if "metric" in route:
+            if self._is_default_route(route):
+                self.config[family]["route-metric"] = f'{route["metric"]}'
+            else:
+                value += f',{route["metric"]}'
         route_key = self._get_next_numbered_section(family, "route")
         self.config[family][route_key] = value
         if "mtu" in route:
@@ -239,7 +264,10 @@ class NMConnection:
         Extends the ipv[46].dns property with a name server.
         """
         family = "ipv6" if is_ipv6_address(dns) else "ipv4"
-        if self.config.has_section(family):
+        if (
+            self.config.has_section(family)
+            and self._get_config_option(family, "method") != "disabled"
+        ):
             self._set_default(family, "dns", "")
             self.config[family]["dns"] = self.config[family]["dns"] + dns + ";"
 
@@ -248,7 +276,10 @@ class NMConnection:
         Extends the ipv[46].dns-search property with a name server.
         """
         for family in ["ipv4", "ipv6"]:
-            if self.config.has_section(family):
+            if (
+                self.config.has_section(family)
+                and self._get_config_option(family, "method") != "disabled"
+            ):
                 self._set_default(family, "dns-search", "")
                 self.config[family]["dns-search"] = (
                     self.config[family]["dns-search"]
@@ -311,17 +342,59 @@ class NMConnection:
 
         # These are the interface properties that map nicely
         # to NetworkManager properties
+        # NOTE: Please ensure these items are formatted so as
+        # to match the schema in schema-network-config-v1.json
+        #
+        # Supported parameters
+        # https://networkmanager.dev/docs/libnm/latest/NMSettingBond.html#NMSettingBond.other
+        # https://www.kernel.org/doc/Documentation/networking/bonding.txt
         _prop_map = {
             "bond": {
                 "mode": "bond-mode",
-                "miimon": "bond_miimon",
-                "xmit_hash_policy": "bond-xmit-hash-policy",
-                "num_grat_arp": "bond-num-grat-arp",
+                "miimon": "bond-miimon",
+                # only in balance-xor(2), 802.3ad(4), balance-tlb(5)
+                "xmit_hash_policy": "bond-xmit_hash_policy",
+                # only in active-backup(1)
+                "num_grat_arp": "bond-num_grat_arp",
                 "downdelay": "bond-downdelay",
                 "updelay": "bond-updelay",
-                "fail_over_mac": "bond-fail-over-mac",
-                "primary_reselect": "bond-primary-reselect",
+                "fail_over_mac": "bond-fail_over_mac",
+                # only in active-backup(1), balance-tlb(5), balance-alb(6)
+                "primary_reselect": "bond-primary_reselect",
+                # only in active-backup(1), balance-tlb(5), balance-alb(6)
                 "primary": "bond-primary",
+                # only in active-backup(1), balance-tlb(5), balance-alb(6)
+                "active_slave": "bond-active_slave",
+                # only in 802.3ad(4)
+                "ad_actor_sys_prio": "bond-ad_actor_sys_prio",
+                # only in 802.3ad(4)
+                "ad_actor_system": "bond-ad_actor_system",
+                # only in 802.3ad(4)
+                "ad_select": "bond-ad_select",
+                # only in 802.3ad(4)
+                "ad_user_port_key": "bond-ad_user_port_key",
+                "all_slaves_active": "bond-all_slaves_active",
+                "arp_all_targets": "bond-arp_all_targets",
+                "arp_interval": "bond-arp_interval",
+                "arp_ip_target": "bond-arp_ip_target",
+                "arp_validate": "bond-arp_validate",
+                # only in 802.3ad(4)
+                "lacp_rate": "bond-lacp_rate",
+                # only in balance-tlb(5), balance-alb(6)
+                "lp_interval": "bond-lp_interval",
+                # only in 802.3ad(4)
+                "min_links": "bond-min_links",
+                # only in active-backup(1)
+                "num_unsol_na": "bond-num_unsol_na",
+                # only in balance-rr(0)
+                "packets_per_slave": "bond-packets_per_slave",
+                # only in active-backup(1)
+                "peer_notif_delay": "bond-peer_notif_delay",
+                # only in active-backup(1), balance rr(0), tlb(5), alb(6)
+                "resend_igmp": "bond-resend_igmp",
+                # only in balance-tlb(5)
+                "tlb_dynamic_lb": "bond-tlb_dynamic_lb",
+                "use_carrier": "bond-use_carrier",
             },
             "bridge": {
                 "stp": "bridge_stp",
@@ -340,6 +413,17 @@ class NMConnection:
         found_dns_search = []
 
         # Deal with Layer 3 configuration
+        if if_type == "bond" and not iface["subnets"]:
+            # If there is no L3 subnet config for a given connection,
+            # ensure it is disabled. Without this, the interface
+            # defaults to 'auto' which implies DHCP. This is problematic
+            # for certain configurations such as bonds where the root
+            # device itself may not have a subnet config and should be
+            # disabled while a separate VLAN interface on the bond holds
+            # the subnet information.
+            for family in ["ipv4", "ipv6"]:
+                self._set_ip_method(family, None)
+
         for subnet in iface["subnets"]:
             family = "ipv6" if subnet_is_ipv6(subnet) else "ipv4"
 
@@ -350,6 +434,9 @@ class NMConnection:
                 self.config[family]["gateway"] = subnet["gateway"]
             for route in subnet["routes"]:
                 self._add_route(route)
+            # metric may apply to both dhcp and static config
+            if "metric" in subnet:
+                self.config[family]["route-metric"] = str(subnet["metric"])
             # Add subnet-level DNS
             if "dns_nameservers" in subnet:
                 found_nameservers.extend(subnet["dns_nameservers"])
@@ -405,6 +492,13 @@ class NMConnection:
 
         # Parse type-specific properties
         for nm_prop, key in _prop_map[if_type].items():
+            # Either dashes or underscores may separate the words in a
+            # bond option name: v1 config uses underscores
+            # (bond-fail_over_mac) while v2-derived config uses dashes
+            # (bond-fail-over-mac). Accept both spellings, as the
+            # sysconfig and eni renderers already do.
+            if key not in iface:
+                key = key.replace("_", "-")
             if key not in iface:
                 continue
             if iface[key] is None:
@@ -431,6 +525,16 @@ class NMConnection:
             self.config["vlan"]["parent"] = renderer.con_ref(
                 iface["vlan-raw-device"]
             )
+        if if_type == "bond":
+            if ipv4_mtu is not None or iface["mac_address"] is not None:
+                if "ethernet" not in self.config:
+                    self.config["ethernet"] = {}
+            if ipv4_mtu is not None:
+                self.config["ethernet"]["mtu"] = str(ipv4_mtu)
+            if iface["mac_address"] is not None:
+                self.config["ethernet"]["cloned-mac-address"] = self.mac_addr(
+                    iface["mac_address"]
+                )
         if if_type == "bridge":
             # Bridge is ass-backwards compared to bond
             for port in iface["bridge_ports"]:
@@ -496,11 +600,13 @@ class Renderer(renderer.Renderer):
         # interfaces that have UUIDs that can be linked to from related
         # interfaces
         for iface in network_state.iter_interfaces():
-            self.connections[iface["name"]] = NMConnection(iface["name"])
+            conn_key = iface.get("config_id") or iface["name"]
+            self.connections[conn_key] = NMConnection(iface["name"])
 
         # Now render the actual interface configuration
         for iface in network_state.iter_interfaces():
-            conn = self.connections[iface["name"]]
+            conn_key = iface.get("config_id") or iface["name"]
+            conn = self.connections[conn_key]
             conn.render_interface(iface, network_state, self)
 
         # And finally write the files
@@ -556,12 +662,12 @@ def cloud_init_nm_conf_filename(target=None):
     return f"{target_con_dir}/conf.d/{conf_file}"
 
 
-def available(target=None):
+def available():
     # TODO: Move `uses_systemd` to a more appropriate location
     # It is imported here to avoid circular import
     from cloudinit.distros import uses_systemd
 
-    nmcli_present = subp.which("nmcli", target=target)
+    nmcli_present = subp.which("nmcli")
     service_active = True
     if uses_systemd():
         try:

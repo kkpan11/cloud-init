@@ -2,10 +2,9 @@
 import logging
 import os
 import re
-from collections import namedtuple
-from typing import Optional
+from typing import NamedTuple, Optional
 
-from cloudinit import subp
+from cloudinit import performance, subp
 from cloudinit.util import (
     is_container,
     is_DragonFlyBSD,
@@ -18,8 +17,12 @@ LOG = logging.getLogger(__name__)
 # Path for DMI Data
 DMI_SYS_PATH = "/sys/class/dmi/id"
 
-KernelNames = namedtuple("KernelNames", ["linux", "freebsd", "openbsd"])
-KernelNames.__new__.__defaults__ = (None, None, None)
+
+class KernelNames(NamedTuple):
+    linux: str
+    freebsd: Optional[str]
+    openbsd: Optional[str]
+
 
 # FreeBSD's kenv(1) and Linux /sys/class/dmi/id/* both use different names from
 # dmidecode. The values are the same, and ultimately what we're interested in.
@@ -91,7 +94,9 @@ def _read_dmi_syspath(key: str) -> Optional[str]:
         return None
 
     try:
-        with open(dmi_key_path, "rb") as fp:
+        with performance.Timed(f"Reading {dmi_key_path}"), open(
+            dmi_key_path, "rb"
+        ) as fp:
             key_data = fp.read()
     except PermissionError:
         LOG.debug("Could not read %s", dmi_key_path)

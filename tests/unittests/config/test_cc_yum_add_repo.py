@@ -3,8 +3,6 @@
 import configparser
 import logging
 import re
-import shutil
-import tempfile
 
 import pytest
 
@@ -20,17 +18,15 @@ from tests.unittests import helpers
 LOG = logging.getLogger(__name__)
 
 
-class TestConfig(helpers.FilesystemMockingTestCase):
-    def setUp(self):
-        super(TestConfig, self).setUp()
-        self.tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.tmp)
-
+@pytest.mark.usefixtures("fake_filesystem")
+class TestConfig:
     def test_bad_config(self):
         cfg = {
             "yum_repos": {
                 "epel-testing": {
                     "name": "Extra Packages for Enterprise Linux 5 - Testing",
+                    # At least one of baseurl or metalink or mirrorlist
+                    # must be present.
                     # Missing this should cause the repo not to be written
                     # 'baseurl': 'http://blah.org/pub/epel/testing/5/$barch',
                     "enabled": False,
@@ -40,11 +36,77 @@ class TestConfig(helpers.FilesystemMockingTestCase):
                 },
             },
         }
-        self.patchUtils(self.tmp)
         cc_yum_add_repo.handle("yum_add_repo", cfg, None, [])
-        self.assertRaises(
-            IOError, util.load_text_file, "/etc/yum.repos.d/epel_testing.repo"
-        )
+        with pytest.raises(IOError):
+            util.load_text_file("/etc/yum.repos.d/epel_testing.repo")
+
+    def test_metalink_config(self):
+        cfg = {
+            "yum_repos": {
+                "epel-testing": {
+                    "name": "Extra Packages for Enterprise Linux 5 - Testing",
+                    "metalink": "http://blah.org/pub/epel/testing/5/$basearch",
+                    "enabled": False,
+                    "gpgcheck": True,
+                    "gpgkey": "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL",
+                    "failovermethod": "priority",
+                },
+            },
+        }
+        cc_yum_add_repo.handle("yum_add_repo", cfg, None, [])
+        contents = util.load_text_file("/etc/yum.repos.d/epel-testing.repo")
+        parser = configparser.ConfigParser()
+        parser.read_string(contents)
+        expected = {
+            "epel-testing": {
+                "name": "Extra Packages for Enterprise Linux 5 - Testing",
+                "failovermethod": "priority",
+                "gpgkey": "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL",
+                "enabled": "0",
+                "metalink": "http://blah.org/pub/epel/testing/5/$basearch",
+                "gpgcheck": "1",
+            }
+        }
+        for section in expected:
+            assert parser.has_section(section), "Contains section {0}".format(
+                section
+            )
+            for k, v in expected[section].items():
+                assert parser.get(section, k) == v
+
+    def test_mirrorlist_config(self):
+        cfg = {
+            "yum_repos": {
+                "epel-testing": {
+                    "name": "Extra Packages for Enterprise Linux 5 - Testing",
+                    "mirrorlist": "http://mirrors.blah.org/metalink?repo=rhel-$releasever",
+                    "enabled": False,
+                    "gpgcheck": True,
+                    "gpgkey": "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL",
+                    "failovermethod": "priority",
+                },
+            },
+        }
+        cc_yum_add_repo.handle("yum_add_repo", cfg, None, [])
+        contents = util.load_text_file("/etc/yum.repos.d/epel-testing.repo")
+        parser = configparser.ConfigParser()
+        parser.read_string(contents)
+        expected = {
+            "epel-testing": {
+                "name": "Extra Packages for Enterprise Linux 5 - Testing",
+                "failovermethod": "priority",
+                "gpgkey": "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL",
+                "enabled": "0",
+                "mirrorlist": "http://mirrors.blah.org/metalink?repo=rhel-$releasever",
+                "gpgcheck": "1",
+            }
+        }
+        for section in expected:
+            assert parser.has_section(section), "Contains section {0}".format(
+                section
+            )
+            for k, v in expected[section].items():
+                assert parser.get(section, k) == v
 
     def test_write_config(self):
         cfg = {
@@ -59,8 +121,6 @@ class TestConfig(helpers.FilesystemMockingTestCase):
                 },
             },
         }
-        self.patchUtils(self.tmp)
-        self.patchOS(self.tmp)
         cc_yum_add_repo.handle("yum_add_repo", cfg, None, [])
         contents = util.load_text_file("/etc/yum.repos.d/epel-testing.repo")
         parser = configparser.ConfigParser()
@@ -76,12 +136,11 @@ class TestConfig(helpers.FilesystemMockingTestCase):
             }
         }
         for section in expected:
-            self.assertTrue(
-                parser.has_section(section),
-                "Contains section {0}".format(section),
+            assert parser.has_section(section), "Contains section {0}".format(
+                section
             )
             for k, v in expected[section].items():
-                self.assertEqual(parser.get(section, k), v)
+                assert parser.get(section, k) == v
 
     def test_write_config_array(self):
         cfg = {
@@ -100,7 +159,6 @@ class TestConfig(helpers.FilesystemMockingTestCase):
                 }
             }
         }
-        self.patchUtils(self.tmp)
         cc_yum_add_repo.handle("yum_add_repo", cfg, None, [])
         contents = util.load_text_file(
             "/etc/yum.repos.d/puppetlabs-products.repo"
@@ -120,12 +178,11 @@ class TestConfig(helpers.FilesystemMockingTestCase):
             }
         }
         for section in expected:
-            self.assertTrue(
-                parser.has_section(section),
-                "Contains section {0}".format(section),
+            assert parser.has_section(section), "Contains section {0}".format(
+                section
             )
             for k, v in expected[section].items():
-                self.assertEqual(parser.get(section, k), v)
+                assert parser.get(section, k) == v
 
 
 class TestAddYumRepoSchema:

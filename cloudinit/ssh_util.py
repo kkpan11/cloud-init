@@ -12,7 +12,7 @@ import pwd
 from contextlib import suppress
 from typing import List, Sequence, Tuple
 
-from cloudinit import subp, util
+from cloudinit import lifecycle, subp, util
 
 LOG = logging.getLogger(__name__)
 
@@ -150,7 +150,7 @@ class AuthKeyLineParser:
             # return ketype, key, [comment]
             toks = ent.split(None, 2)
             if len(toks) < 2:
-                raise TypeError("To few fields: %s" % len(toks))
+                raise TypeError("Too few fields: %s" % len(toks))
             if toks[0] not in VALID_KEY_TYPES:
                 raise TypeError("Invalid keytype %s" % toks[0])
 
@@ -163,14 +163,16 @@ class AuthKeyLineParser:
 
         ent = line.strip()
         try:
-            (keytype, base64, comment) = parse_ssh_key(ent)
+            keytype, base64, comment = parse_ssh_key(ent)
         except TypeError:
-            (keyopts, remain) = self._extract_options(ent)
-            if options is None:
+            keyopts, remain = self._extract_options(ent)
+            # If the options parameter is falsy, use options from the key line
+            # (no override)
+            if not options:
                 options = keyopts
 
             try:
-                (keytype, base64, comment) = parse_ssh_key(remain)
+                keytype, base64, comment = parse_ssh_key(remain)
             except TypeError:
                 return AuthKeyLine(src_line)
 
@@ -312,7 +314,7 @@ def check_permissions(username, current_path, full_path, is_file, strictmodes):
 
     # 3. no write permission (w) is given to group and world users (022)
     # Group and world user can still have +rx.
-    if strictmodes and parent_permission & 0o022 != 0:
+    if strictmodes and (parent_permission & 0o022):
         LOG.debug(
             "Path %s in %s must not give write"
             "permission to group or world users. Ignoring key.",
@@ -404,7 +406,7 @@ def check_create_path(username, filename, strictmodes):
 
 
 def extract_authorized_keys(username, sshd_cfg_file=DEF_SSHD_CFG):
-    (ssh_dir, pw_ent) = users_ssh_info(username)
+    ssh_dir, pw_ent = users_ssh_info(username)
     default_authorizedkeys_file = os.path.join(ssh_dir, "authorized_keys")
     user_authorizedkeys_file = default_authorizedkeys_file
     auth_key_fns = []
@@ -468,7 +470,7 @@ def setup_user_keys(keys, username, options=None):
         key_entries.append(parser.parse(str(k), options=options))
 
     # Extract the old and make the new
-    (auth_key_fn, auth_key_entries) = extract_authorized_keys(username)
+    auth_key_fn, auth_key_entries = extract_authorized_keys(username)
     ssh_dir = os.path.dirname(auth_key_fn)
     with util.SeLinuxGuard(ssh_dir, recursive=True):
         content = update_authorized_keys(auth_key_entries, key_entries)
@@ -544,12 +546,15 @@ def parse_ssh_config_map(fname):
 
 
 def _includes_dconf(fname: str) -> bool:
+    # Handle cases where sshd_config is handled in /usr/etc/ssh/sshd_config
+    # so /etc/ssh/sshd_config.d/ exists but /etc/ssh/sshd_config doesn't
+    if not os.path.exists(fname) and os.path.exists(f"{fname}.d"):
+        return True
     if not os.path.isfile(fname):
         return False
-    with open(fname, "r") as f:
-        for line in f:
-            if line.startswith(f"Include {fname}.d/*.conf"):
-                return True
+    for line in util.load_text_file(fname).splitlines():
+        if line.startswith(f"Include {fname}.d/*.conf"):
+            return True
     return False
 
 
@@ -593,7 +598,7 @@ def update_ssh_config_lines(lines, updates):
     # Keywords are case-insensitive and arguments are case-sensitive
     casemap = dict([(k.lower(), k) for k in updates.keys()])
 
-    for (i, line) in enumerate(lines, start=1):
+    for i, line in enumerate(lines, start=1):
         if not line.key:
             continue
         if line.key in casemap:
@@ -671,7 +676,7 @@ def get_opensshd_upstream_version():
     upstream_version = "9.0"
     full_version = get_opensshd_version()
     if full_version is None:
-        return util.Version.from_str(upstream_version)
+        return lifecycle.Version.from_str(upstream_version)
     if "p" in full_version:
         upstream_version = full_version[: full_version.find("p")]
     elif " " in full_version:
@@ -679,7 +684,6 @@ def get_opensshd_upstream_version():
     else:
         upstream_version = full_version
     try:
-        upstream_version = util.Version.from_str(upstream_version)
-        return upstream_version
+        return lifecycle.Version.from_str(upstream_version)
     except (ValueError, TypeError):
         LOG.warning("Could not parse sshd version: %s", upstream_version)

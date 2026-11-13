@@ -307,6 +307,9 @@ class Paths(persistence.CloudInitPickleMixin):
         self.cfgs = path_cfgs
         # Populate all the initial paths
         self.cloud_dir: str = path_cfgs.get("cloud_dir", "/var/lib/cloud")
+        self.docs_dir: str = path_cfgs.get(
+            "docs_dir", "/usr/share/doc/cloud-init/"
+        )
         self.run_dir: str = path_cfgs.get("run_dir", settings.DEFAULT_RUN_DIR)
         self.instance_link: str = os.path.join(self.cloud_dir, "instance")
         self.boot_finished: str = os.path.join(
@@ -348,6 +351,7 @@ class Paths(persistence.CloudInitPickleMixin):
             "vendor_scripts": "scripts/vendor",
             "warnings": "warnings",
             "hotplug.enabled": "hotplug.enabled",
+            ".skip-network": ".skip-network",
         }
         # Set when a datasource becomes active
         self.datasource = ds
@@ -366,13 +370,13 @@ class Paths(persistence.CloudInitPickleMixin):
         if "instance_data" not in self.lookups:
             self.lookups["instance_data"] = "instance-data.json"
         if "instance_data_sensitive" not in self.lookups:
-            self.lookups[
-                "instance_data_sensitive"
-            ] = "instance-data-sensitive.json"
+            self.lookups["instance_data_sensitive"] = (
+                "instance-data-sensitive.json"
+            )
         if "combined_cloud_config" not in self.lookups:
-            self.lookups[
-                "combined_cloud_config"
-            ] = "combined-cloud-config.json"
+            self.lookups["combined_cloud_config"] = (
+                "combined-cloud-config.json"
+            )
         if "hotplug.enabled" not in self.lookups:
             self.lookups["hotplug.enabled"] = "hotplug.enabled"
 

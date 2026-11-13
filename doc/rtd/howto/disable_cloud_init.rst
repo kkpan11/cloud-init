@@ -18,18 +18,18 @@ not be started.
 
 Example:
 
-.. code-block::
+.. code-block:: shell-session
 
     $ touch /etc/cloud/cloud-init.disabled
 
-Method 2: kernel commandline
-============================
+Method 2: kernel command line
+=============================
 
-To disable cloud-init, add ``cloud-init=disabled`` to the kernel commandline.
+To disable cloud-init, add ``cloud-init=disabled`` to the kernel command line.
 
 Example (using GRUB2 with Ubuntu):
 
-.. code-block::
+.. code-block:: shell-session
 
     $ echo 'GRUB_CMDLINE_LINUX="cloud-init=disabled"' >> /etc/default/grub
     $ grub-mkconfig -o /boot/efi/EFI/ubuntu/grub.cfg
@@ -43,6 +43,6 @@ processes.
 
 Example (using systemd):
 
-.. code-block::
+.. code-block:: shell-session
 
     $ echo "DefaultEnvironment=KERNEL_CMDLINE=cloud-init=disabled" >> /etc/systemd/system.conf

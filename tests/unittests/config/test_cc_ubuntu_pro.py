@@ -1,14 +1,14 @@
 # This file is part of cloud-init. See LICENSE file for license information.
+import importlib.metadata
 import json
 import logging
 import re
 import sys
 from collections import namedtuple
 
-import jsonschema
 import pytest
 
-from cloudinit import subp
+from cloudinit import lifecycle, subp
 from cloudinit.config.cc_ubuntu_pro import (
     _attach,
     _auto_attach,
@@ -24,9 +24,13 @@ from cloudinit.config.schema import (
     get_schema,
     validate_cloudconfig_schema,
 )
-from cloudinit.util import Version
 from tests.unittests.helpers import does_not_raise, mock, skipUnlessJsonSchema
 from tests.unittests.util import get_cloud
+
+try:
+    import jsonschema
+except ImportError:
+    jsonschema = None  # type: ignore
 
 # Module path used in mocks
 MPATH = "cloudinit.config.cc_ubuntu_pro"
@@ -53,19 +57,24 @@ def fake_uaclient(mocker):
     m_uaclient = mock.Mock()
 
     sys.modules["uaclient"] = m_uaclient
+    mock_exceptions_module = mock.Mock()
 
     # Exceptions
-    _exceptions = namedtuple(
-        "exceptions",
+    Exceptions = namedtuple(
+        "Exceptions",
         [
             "UserFacingError",
             "AlreadyAttachedError",
         ],
-    )(
+    )
+    mock_exceptions_module.UserFacingError = FakeUserFacingError
+    mock_exceptions_module.AlreadyAttachedError = FakeAlreadyAttachedError
+    sys.modules["uaclient.api.exceptions"] = mock_exceptions_module
+    _exceptions = Exceptions(
         FakeUserFacingError,
         FakeAlreadyAttachedError,
     )
-    sys.modules["uaclient.api.exceptions"] = _exceptions
+    return _exceptions
 
 
 @pytest.mark.usefixtures("fake_uaclient")
@@ -156,8 +165,10 @@ class TestConfigurePro:
                     (
                         MPATH,
                         logging.DEBUG,
-                        "Attaching to Ubuntu Pro. pro attach"
-                        " --no-auto-enable REDACTED",
+                        (
+                            "Attaching to Ubuntu Pro. pro attach"
+                            " --no-auto-enable REDACTED"
+                        ),
                     )
                 ],
                 id="with_specific_services",
@@ -193,14 +204,18 @@ class TestConfigurePro:
                     (
                         MPATH,
                         logging.DEBUG,
-                        "Attaching to Ubuntu Pro. pro attach"
-                        " --no-auto-enable REDACTED",
+                        (
+                            "Attaching to Ubuntu Pro. pro attach"
+                            " --no-auto-enable REDACTED"
+                        ),
                     ),
                     (
                         MPATH,
                         logging.WARNING,
-                        "ubuntu_pro: enable should be a list, not a "
-                        "string; treating as a single enable",
+                        (
+                            "ubuntu_pro: enable should be a list, not a "
+                            "string; treating as a single enable"
+                        ),
                     ),
                 ],
                 id="with_string_services",
@@ -224,8 +239,10 @@ class TestConfigurePro:
                     (
                         MPATH,
                         logging.WARNING,
-                        "ubuntu_pro: enable should be a list, not a"
-                        " dict; skipping enabling services",
+                        (
+                            "ubuntu_pro: enable should be a list, not a"
+                            " dict; skipping enabling services"
+                        ),
                     ),
                 ],
                 id="with_weird_services",
@@ -441,16 +458,17 @@ class TestUbuntuProSchema:
                     SchemaValidationError,
                     match=re.escape(
                         "ubuntu_advantage:  Deprecated in version 24.1."
-                        " Use ``ubuntu_pro`` instead"
+                        " Use **ubuntu_pro** instead"
                     ),
                 ),
-                # If __version__ no longer exists on jsonschema, that means
-                # we're using a high enough version of jsonschema to not need
-                # to skip this test.
-                JSONSCHEMA_SKIP_REASON
-                if Version.from_str(getattr(jsonschema, "__version__", "999"))
-                < Version(4)
-                else "",
+                (
+                    JSONSCHEMA_SKIP_REASON
+                    if lifecycle.Version.from_str(
+                        importlib.metadata.version("jsonschema")
+                    )
+                    < lifecycle.Version(4)
+                    else ""
+                ),
                 id="deprecation_of_ubuntu_advantage_skip_old_json",
             ),
             # Strict keys
@@ -654,8 +672,10 @@ class TestUbuntuProSchema:
                     ),
                 ),
                 [
-                    "'ubuntu_pro.features.disable_auto_attach' should be"
-                    " a bool, not a list\n"
+                    (
+                        "'ubuntu_pro.features.disable_auto_attach' should be"
+                        " a bool, not a list\n"
+                    )
                 ],
             ),
         ],
@@ -694,8 +714,10 @@ class TestHandle:
                     (
                         MPATH,
                         logging.DEBUG,
-                        "Skipping module named nomatter, no 'ubuntu_pro'"
-                        " configuration found",
+                        (
+                            "Skipping module named nomatter, no 'ubuntu_pro'"
+                            " configuration found"
+                        ),
                     )
                 ],
                 [],
@@ -746,9 +768,11 @@ class TestHandle:
                     (
                         MPATH,
                         logging.WARNING,
-                        "Deprecated configuration key(s) provided:"
-                        ' ubuntu-advantage. Expected "ubuntu_pro"; will'
-                        " attempt to continue.",
+                        (
+                            "Deprecated configuration key(s) provided:"
+                            ' ubuntu-advantage. Expected "ubuntu_pro"; will'
+                            " attempt to continue."
+                        ),
                     ),
                 ],
                 None,
@@ -770,8 +794,10 @@ class TestHandle:
                     (
                         MPATH,
                         logging.DEBUG,
-                        "Ignoring `ubuntu_pro.enable_beta` services in"
-                        " Pro attach: realtime-kernel",
+                        (
+                            "Ignoring `ubuntu_pro.enable_beta` services in"
+                            " Pro attach: realtime-kernel"
+                        ),
                     )
                 ],
                 None,
@@ -790,15 +816,19 @@ class TestHandle:
                     (
                         MPATH,
                         logging.WARNING,
-                        "Deprecated configuration key(s) provided:"
-                        ' ubuntu-advantage. Expected "ubuntu_pro"; will'
-                        " attempt to continue.",
+                        (
+                            "Deprecated configuration key(s) provided:"
+                            ' ubuntu-advantage. Expected "ubuntu_pro"; will'
+                            " attempt to continue."
+                        ),
                     ),
                     (
                         MPATH,
                         logging.WARNING,
-                        "Ignoring deprecated key ubuntu-advantage and"
-                        " preferring ubuntu_pro config",
+                        (
+                            "Ignoring deprecated key ubuntu-advantage and"
+                            " preferring ubuntu_pro config"
+                        ),
                     ),
                 ],
                 None,
@@ -829,7 +859,7 @@ class TestHandle:
         caplog,
     ):
         """Non-Pro schemas and instance."""
-        handle("nomatter", cfg=cfg, cloud=cloud, args=None)
+        handle("nomatter", cfg=cfg, cloud=cloud, args=[])
         for record_tuple in log_record_tuples:
             assert record_tuple in caplog.record_tuples
         if maybe_install_call_args_list is not None:
@@ -956,7 +986,7 @@ class TestHandle:
             m_auto_attach.side_effect = auto_attach_side_effect
 
         with expectation:
-            handle("nomatter", cfg=cfg, cloud=cloud, args=None)
+            handle("nomatter", cfg=cfg, cloud=cloud, args=[])
 
         for record_tuple in log_record_tuples:
             assert record_tuple in caplog.record_tuples
@@ -1001,7 +1031,7 @@ class TestHandle:
         enable or disable pro auto-attach.
         """
         m_should_auto_attach.return_value = is_pro
-        handle("nomatter", cfg=cfg, cloud=self.cloud, args=None)
+        handle("nomatter", cfg=cfg, cloud=self.cloud, args=[])
         assert not m_attach.call_args_list
 
     @pytest.mark.parametrize(
@@ -1056,7 +1086,7 @@ class TestHandle:
                 "nomatter",
                 cfg=cfg,
                 cloud=self.cloud,
-                args=None,
+                args=[],
             )
 
     @mock.patch(f"{MPATH}.subp.subp")
@@ -1082,7 +1112,7 @@ class TestHandle:
                 "nomatter",
                 cfg=cfg,
                 cloud=self.cloud,
-                args=None,
+                args=[],
             )
         assert not caplog.text
 
@@ -1102,7 +1132,7 @@ class TestHandle:
                 "nomatter",
                 cfg=cfg,
                 cloud=self.cloud,
-                args=None,
+                args=[],
             )
         assert [] == m_subp.call_args_list
         assert (
@@ -1116,9 +1146,9 @@ class TestShouldAutoAttach:
         m_should_auto_attach.should_auto_attach.side_effect = (
             FakeUserFacingError("Some error")  # noqa: E501
         )
-        sys.modules[
-            "uaclient.api.u.pro.attach.auto.should_auto_attach.v1"
-        ] = m_should_auto_attach
+        sys.modules["uaclient.api.u.pro.attach.auto.should_auto_attach.v1"] = (
+            m_should_auto_attach
+        )
         assert not _should_auto_attach({})
         assert "Error during `should_auto_attach`: Some error" in caplog.text
         assert (
@@ -1140,20 +1170,18 @@ class TestShouldAutoAttach:
         self, ua_section, expected_result, caplog, fake_uaclient
     ):
         m_should_auto_attach = mock.Mock()
-        sys.modules[
-            "uaclient.api.u.pro.attach.auto.should_auto_attach.v1"
-        ] = m_should_auto_attach
+        sys.modules["uaclient.api.u.pro.attach.auto.should_auto_attach.v1"] = (
+            m_should_auto_attach
+        )
         should_auto_attach_value = object()
         m_should_auto_attach.should_auto_attach.return_value.should_auto_attach = (  # noqa: E501
             should_auto_attach_value
         )
-        if expected_result is None:  # Pro API does respond
+        if expected_result is None:
+            # Pro API does respond
             assert should_auto_attach_value == _should_auto_attach(ua_section)
-            assert (
-                "Checking if the instance can be attached to Ubuntu Pro took"
-                in caplog.text
-            )
-        else:  # cloud-init does respond
+        else:
+            # cloud-init does respond
             assert expected_result == _should_auto_attach(ua_section)
             assert not caplog.text
 
@@ -1169,9 +1197,9 @@ class TestAutoAttach:
         m_full_auto_attach.full_auto_attach.side_effect = FakeUserFacingError(
             "Some error"
         )
-        sys.modules[
-            "uaclient.api.u.pro.attach.auto.full_auto_attach.v1"
-        ] = m_full_auto_attach
+        sys.modules["uaclient.api.u.pro.attach.auto.full_auto_attach.v1"] = (
+            m_full_auto_attach
+        )
         expected_msg = "Error during `full_auto_attach`: Some error"
         with pytest.raises(RuntimeError, match=re.escape(expected_msg)):
             _auto_attach(self.ua_section)
@@ -1180,11 +1208,10 @@ class TestAutoAttach:
     def test_happy_path(self, caplog, mocker, fake_uaclient):
         mocker.patch.dict("sys.modules")
         sys.modules["uaclient.config"] = mock.Mock()
-        sys.modules[
-            "uaclient.api.u.pro.attach.auto.full_auto_attach.v1"
-        ] = mock.Mock()
+        sys.modules["uaclient.api.u.pro.attach.auto.full_auto_attach.v1"] = (
+            mock.Mock()
+        )
         _auto_attach(self.ua_section)
-        assert "Attaching to Ubuntu Pro took" in caplog.text
 
 
 class TestAttach:

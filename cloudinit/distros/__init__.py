@@ -10,14 +10,17 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
 import abc
+import functools
 import logging
 import os
 import re
+import shlex
 import stat
 import string
 import urllib.parse
 from collections import defaultdict
 from contextlib import suppress
+from enum import Enum
 from io import StringIO
 from typing import (
     Any,
@@ -30,12 +33,14 @@ from typing import (
     Tuple,
     Type,
     Union,
+    final,
 )
 
 import cloudinit.net.netops.iproute2 as iproute2
 from cloudinit import (
     helpers,
     importer,
+    lifecycle,
     net,
     persistence,
     ssh_util,
@@ -49,7 +54,10 @@ from cloudinit.distros.package_management.package_manager import PackageManager
 from cloudinit.distros.package_management.utils import known_package_managers
 from cloudinit.distros.parsers import hosts
 from cloudinit.features import ALLOW_EC2_MIRRORS_ON_NON_AWS_INSTANCE_TYPES
+from cloudinit.lifecycle import log_with_downgradable_level
+from cloudinit.log import loggers
 from cloudinit.net import activators, dhcp, renderers
+from cloudinit.net.netops import NetOps
 from cloudinit.net.network_state import parse_net_config_data
 from cloudinit.net.renderer import Renderer
 
@@ -59,8 +67,9 @@ ALL_DISTROS = "all"
 
 OSFAMILIES = {
     "alpine": ["alpine"],
+    "aosc": ["aosc"],
     "arch": ["arch"],
-    "debian": ["debian", "ubuntu"],
+    "debian": ["debian", "ubuntu", "raspberry-pi-os"],
     "freebsd": ["freebsd", "dragonfly"],
     "gentoo": ["gentoo", "cos"],
     "netbsd": ["netbsd"],
@@ -97,10 +106,6 @@ OSFAMILIES = {
 
 LOG = logging.getLogger(__name__)
 
-# This is a best guess regex, based on current EC2 AZs on 2017-12-11.
-# It could break when Amazon adds new regions and new AZs.
-_EC2_AZ_RE = re.compile("^[a-z][a-z]-(?:[a-z]+-)+[0-9][a-z]$")
-
 # Default NTP Client Configurations
 PREFERRED_NTP_CLIENTS = ["chrony", "systemd-timesyncd", "ntp", "ntpdate"]
 
@@ -121,6 +126,99 @@ PackageList = Union[
     List[Union[str, List[str], Mapping]],
 ]
 
+# Hard-coded application identifier
+APP_ID = "canonical.cloud-init"
+
+
+class OWASPEventLevel(Enum):
+    """OWASP log levels."""
+
+    INFO = "INFO"
+    WARN = "WARN"
+    CRITICAL = "CRITICAL"
+
+
+class OWASPEventType(Enum):
+    """OWASP security event types."""
+
+    # User management events [USER]
+    USER_CREATED = "user_created"
+    # TODO(USER_UPDATED = "user_updated")
+
+
+def log_security_event(
+    event_type: OWASPEventType,
+    level: OWASPEventLevel,
+    description: str,
+    event_params: Optional[List[str]] = None,
+) -> None:
+    """
+    Log a security event in OWASP format.
+
+    :param event_type: Type of security event.
+    :param level: OWASP Log level (INFO, WARN, CRITICAL).
+    :param description: Human-readable description of the event.
+    :param event_params: Parameters to include in the event string.
+
+    The logging format follows the OWASP Logging Vocabulary Cheat Sheet:
+    https://github.com/OWASP/CheatSheetSeries/blob/master/cheatsheets/Logging_Vocabulary_Cheat_Sheet.md
+
+    Security events are logged in JSON Lines format with standardized fields:
+    - datetime: ISO 8601 timestamp with UTC offset
+    - appid: Application identifier (canonical.cloud-init)
+    - type: "security"
+    - event: Event type with optional parameters
+      (e.g., user_created:root,ubuntu)
+    - level: INFO, WARN, or CRITICAL
+    - description: Human-readable summary
+    - hostname: S
+    """
+    # cloud-init is the default primary 'actor' for any system change operation
+    params = ["cloud-init"]
+    if event_params:
+        params.extend(event_params)
+    event = {
+        "appid": APP_ID,
+        "type": "security",
+        "event": f"{event_type.value}:{','.join(params)}",
+        "level": level.value,
+        "description": description,
+        "hostname": util.get_hostname(),
+    }
+    LOG.log(loggers.SECURITY, event)
+
+
+def sec_log_user_created(func):
+    """Log user creation after add_user or add_snap_user returns successfully.
+
+    The security log will contain group information and elevated roles.
+    """
+
+    @functools.wraps(func)
+    def decorator(
+        self, name: str, *args, groups: Optional[List[str]] = None, **kwargs
+    ):
+        params = [name]
+        groups_msg = ""
+        if groups is None:
+            groups = []
+        all_groups = groups + _get_elevated_roles(**kwargs)
+        if all_groups:
+            groups_suffix = ",".join(all_groups)
+            groups_msg = f" in groups: {groups_suffix}"
+            params.append(f"groups:{groups_suffix}")
+
+        response = func(self, name, *args, groups=groups, **kwargs)
+        log_security_event(
+            event_type=OWASPEventType.USER_CREATED,
+            level=OWASPEventLevel.INFO,
+            description=f"User '{name}' was created{groups_msg}",
+            event_params=params,
+        )
+        return response
+
+    return decorator
+
 
 class PackageInstallerError(Exception):
     pass
@@ -133,16 +231,20 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
     doas_fn = "/etc/doas.conf"
     ci_sudoers_fn = "/etc/sudoers.d/90-cloud-init-users"
     hostname_conf_fn = "/etc/hostname"
+    shadow_fn = "/etc/shadow"
+    shadow_extrausers_fn = "/var/lib/extrausers/shadow"
+    # /etc/shadow match patterns indicating empty passwords
+    shadow_empty_locked_passwd_patterns = ["^{username}::", "^{username}:!:"]
     tz_zone_dir = "/usr/share/zoneinfo"
     default_owner = "root:root"
-    init_cmd = ["service"]  # systemctl, service etc
+    init_cmd: List[str] = ["service"]  # systemctl, service etc
     renderer_configs: Mapping[str, MutableMapping[str, Any]] = {}
     _preferred_ntp_clients = None
     networking_cls: Type[Networking] = LinuxNetworking
     # This is used by self.shutdown_command(), and can be overridden in
     # subclasses
     shutdown_options_map = {"halt": "-H", "poweroff": "-P", "reboot": "-r"}
-    net_ops = iproute2.Iproute2
+    net_ops: Type[NetOps] = iproute2.Iproute2
 
     _ci_pkl_version = 1
     prefer_fqdn = False
@@ -169,6 +271,7 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         self.package_managers: List[PackageManager] = []
         self._dhcp_client = None
         self._fallback_interface = None
+        self.is_linux = True
 
     def _unpickle(self, ci_pkl_version: int) -> None:
         """Perform deserialization fixes for Distro."""
@@ -185,6 +288,8 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
             self._dhcp_client = None
         if not hasattr(self, "_fallback_interface"):
             self._fallback_interface = None
+        if not hasattr(self, "is_linux"):
+            self.is_linux = True
 
     def _validate_entry(self, entry):
         if isinstance(entry, str):
@@ -339,17 +444,19 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         raise dhcp.NoDHCPLeaseMissingDhclientError()
 
     @property
-    def network_activator(self) -> Optional[Type[activators.NetworkActivator]]:
-        """Return the configured network activator for this environment."""
+    def network_activator(self) -> Type[activators.NetworkActivator]:
+        """Return the configured network activator for this environment.
+
+        :returns: The network activator class to use
+        :raises: NoActivatorException if no activator is found
+        """
         priority = util.get_cfg_by_path(
             self._cfg, ("network", "activators"), None
         )
-        try:
-            return activators.select_activator(priority=priority)
-        except activators.NoActivatorException:
-            return None
+        return activators.select_activator(priority=priority)
 
-    def _get_renderer(self) -> Renderer:
+    @property
+    def network_renderer(self) -> Renderer:
         priority = util.get_cfg_by_path(
             self._cfg, ("network", "renderers"), None
         )
@@ -395,10 +502,16 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         # managers.
         raise NotImplementedError()
 
-    def update_package_sources(self):
+    def update_package_sources(self, *, force=False):
         for manager in self.package_managers:
+            if not manager.available():
+                LOG.debug(
+                    "Skipping update for package manager '%s': not available.",
+                    manager.name,
+                )
+                continue
             try:
-                manager.update_package_sources()
+                manager.update_package_sources(force=force)
             except Exception as e:
                 LOG.error(
                     "Failed to update package using %s: %s", manager.name, e
@@ -436,15 +549,16 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
 
         Returns True if any devices failed to come up, otherwise False.
         """
-        renderer = self._get_renderer()
+        renderer = self.network_renderer
         network_state = parse_net_config_data(netconfig, renderer=renderer)
         self._write_network_state(network_state, renderer)
 
         # Now try to bring them up
         if bring_up:
             LOG.debug("Bringing up newly configured network interfaces")
-            network_activator = self.network_activator
-            if not network_activator:
+            try:
+                network_activator = self.network_activator
+            except activators.NoActivatorException:
                 LOG.warning(
                     "No network activator found, not bringing up "
                     "network interfaces"
@@ -492,8 +606,7 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         try:
             subp.subp(["hostname", hostname])
         except subp.ProcessExecutionError:
-            util.logexc(
-                LOG,
+            LOG.warning(
                 "Failed to non-persistently adjust the system hostname to %s",
                 hostname,
             )
@@ -538,7 +651,7 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
 
         # Lets get where we should write the system hostname
         # and what the system hostname is
-        (sys_fn, sys_hostname) = self._read_system_hostname()
+        sys_fn, sys_hostname = self._read_system_hostname()
         update_files = []
 
         # If there is no previous hostname or it differs
@@ -565,10 +678,10 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
             )
             return
 
-        # Remove duplicates (incase the previous config filename)
+        # Remove duplicates (in case the previous config filename)
         # is the same as the system config filename, don't bother
         # doing it twice
-        update_files = set([f for f in update_files if f])
+        update_files = list(set([f for f in update_files if f]))
         LOG.debug(
             "Attempting to update hostname to %s in %s files",
             hostname,
@@ -642,25 +755,68 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
     def get_default_user(self):
         return self.get_option("default_user")
 
-    def add_user(self, name, **kwargs):
+    @final
+    @sec_log_user_created
+    def add_user(
+        self,
+        name: str,
+        *,
+        groups: List[str],
+        create_groups: Optional[bool] = True,
+        primary_group: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        """Add a user to the system."""
+
+        if groups and primary_group:
+            groups = groups + [primary_group]
+
+        if create_groups and groups:
+            for group in groups:
+                if not util.is_group(group):
+                    self.create_group(group)
+                    LOG.debug("created group '%s' for user '%s'", group, name)
+
+        LOG.debug("Adding user %s", name)
+        self._add_user(
+            name,
+            groups=groups,
+            primary_group=primary_group,
+            create_groups=create_groups,
+            **kwargs,
+        )
+
+    def _add_user(
+        self,
+        name: str,
+        *,
+        groups: List[str],
+        **kwargs,
+    ) -> None:
+        """Internal user-creation implementation; override in subclasses.
+
+        Subclasses should override this instead of add_user to plug in
+        distro-specific user-creation tools while letting add_user handle
+        group setup.
         """
-        Add a user to the system using standard GNU tools
+        cmd, log_cmd = self._build_add_user_cmd(name, groups, **kwargs)
+        try:
+            subp.subp(cmd, logstring=log_cmd)
+        except subp.ProcessExecutionError:
+            LOG.warning("Failed to create user %s", name)
+            raise
+        self._post_add_user(name, **kwargs)
 
-        This should be overridden on distros where useradd is not desirable or
-        not available.
+    def _build_add_user_cmd(
+        self, name: str, groups: List[str], **kwargs
+    ) -> Tuple[List[str], List[str]]:
+        """Build the useradd command for GNU/Linux systems.
+
+        Overridden  for distro-specific user-creation tools.
+
+        Returns a (cmd, log_cmd) tuple where log_cmd has sensitive values
+        redacted.
         """
-        # XXX need to make add_user idempotent somehow as we
-        # still want to add groups or modify SSH keys on pre-existing
-        # users in the image.
-        if util.is_user(name):
-            LOG.info("User %s already exists, skipping.", name)
-            return
-
-        if "create_groups" in kwargs:
-            create_groups = kwargs.pop("create_groups")
-        else:
-            create_groups = True
-
         useradd_cmd = ["useradd", name]
         log_useradd_cmd = ["useradd", name]
         if util.system_is_snappy():
@@ -675,7 +831,6 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
             "homedir": "--home",
             "primary_group": "--gid",
             "uid": "--uid",
-            "groups": "--groups",
             "passwd": "--password",
             "shell": "--shell",
             "expiredate": "--expiredate",
@@ -691,51 +846,19 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
 
         redact_opts = ["passwd"]
 
-        # support kwargs having groups=[list] or groups="g1,g2"
-        groups = kwargs.get("groups")
-        if groups:
-            if isinstance(groups, str):
-                groups = groups.split(",")
-
-            if isinstance(groups, dict):
-                util.deprecate(
-                    deprecated=f"The user {name} has a 'groups' config value "
-                    "of type dict",
-                    deprecated_version="22.3",
-                    extra_message="Use a comma-delimited string or "
-                    "array instead: group1,group2.",
-                )
-
-            # remove any white spaces in group names, most likely
-            # that came in as a string like: groups: group1, group2
-            groups = [g.strip() for g in groups]
-
-            # kwargs.items loop below wants a comma delimited string
-            # that can go right through to the command.
-            kwargs["groups"] = ",".join(groups)
-
-            primary_group = kwargs.get("primary_group")
-            if primary_group:
-                groups.append(primary_group)
-
-        if create_groups and groups:
-            for group in groups:
-                if not util.is_group(group):
-                    self.create_group(group)
-                    LOG.debug("created group '%s' for user '%s'", group, name)
-        if "uid" in kwargs.keys():
-            kwargs["uid"] = str(kwargs["uid"])
-
         # Check the values and create the command
+        if groups:
+            useradd_cmd.extend(["--groups", ",".join(groups)])
+            log_useradd_cmd.extend(["--groups", ",".join(groups)])
         for key, val in sorted(kwargs.items()):
-            if key in useradd_opts and val and isinstance(val, str):
-                useradd_cmd.extend([useradd_opts[key], val])
+            if key in useradd_opts and val and isinstance(val, (str, int)):
+                useradd_cmd.extend([useradd_opts[key], str(val)])
 
                 # Redact certain fields from the logs
                 if key in redact_opts:
                     log_useradd_cmd.extend([useradd_opts[key], "REDACTED"])
                 else:
-                    log_useradd_cmd.extend([useradd_opts[key], val])
+                    log_useradd_cmd.extend([useradd_opts[key], str(val)])
 
             elif key in useradd_flags and val:
                 useradd_cmd.append(useradd_flags[key])
@@ -750,14 +873,16 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
             useradd_cmd.append("-m")
             log_useradd_cmd.append("-m")
 
-        # Run the command
-        LOG.debug("Adding user %s", name)
-        try:
-            subp.subp(useradd_cmd, logstring=log_useradd_cmd)
-        except Exception as e:
-            util.logexc(LOG, "Failed to create user %s", name)
-            raise e
+        return useradd_cmd, log_useradd_cmd
 
+    def _post_add_user(self, name: str, **kwargs) -> None:
+        """Hook called after the user-creation command succeeds.
+
+        Overridden to perform distro-specific post-creation steps.
+        """
+
+    @final
+    @sec_log_user_created
     def add_snap_user(self, name, **kwargs):
         """
         Add a snappy user to the system using snappy tools
@@ -768,24 +893,65 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         create_user_cmd = ["snap", "create-user", "--sudoer", "--json"]
         if known:
             create_user_cmd.append("--known")
-        create_user_cmd.append(snapuser)
+        if snapuser:
+            create_user_cmd.append(snapuser)
+        else:
+            LOG.warning("invalid snap user: %s", snapuser)
 
         # Run the command
         LOG.debug("Adding snap user %s", name)
         try:
-            (out, err) = subp.subp(
+            out, err = subp.subp(
                 create_user_cmd, logstring=create_user_cmd, capture=True
             )
             LOG.debug("snap create-user returned: %s:%s", out, err)
-            jobj = util.load_json(out)
-            username = jobj.get("username", None)
-        except Exception as e:
-            util.logexc(LOG, "Failed to create snap user %s", name)
-            raise e
+        except subp.ProcessExecutionError:
+            LOG.warning("Failed to create snap user %s", name)
+            raise
 
-        return username
+    def _shadow_file_has_empty_user_password(self, username) -> bool:
+        """
+        Check whether username exists in shadow files with empty password.
 
-    def create_user(self, name, **kwargs):
+        Support reading /var/lib/extrausers/shadow on snappy systems.
+        """
+        if util.system_is_snappy():
+            shadow_files = [self.shadow_extrausers_fn, self.shadow_fn]
+        else:
+            shadow_files = [self.shadow_fn]
+        shadow_empty_passwd_re = "|".join(
+            [
+                pattern.format(username=username)
+                for pattern in self.shadow_empty_locked_passwd_patterns
+            ]
+        )
+        for shadow_file in shadow_files:
+            if not os.path.exists(shadow_file):
+                continue
+            shadow_content = util.load_text_file(shadow_file)
+            if not re.findall(rf"^{username}:", shadow_content, re.MULTILINE):
+                LOG.debug("User %s not found in %s", username, shadow_file)
+                continue
+            LOG.debug(
+                "User %s found in %s. Checking for empty password",
+                username,
+                shadow_file,
+            )
+            if re.findall(
+                shadow_empty_passwd_re, shadow_content, re.MULTILINE
+            ):
+                return True
+        return False
+
+    @final
+    def create_user(
+        self,
+        name: str,
+        *,
+        groups: List[str],
+        create_groups: Optional[bool] = True,
+        **kwargs,
+    ):
         """
         Creates or partially updates the ``name`` user in the system.
 
@@ -810,21 +976,108 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         if "snapuser" in kwargs:
             return self.add_snap_user(name, **kwargs)
 
-        # Add the user
-        self.add_user(name, **kwargs)
+        pre_existing_user = util.is_user(name)
+        if pre_existing_user:
+            LOG.info("Skipping '%s' user creation: user already exists.", name)
+        else:
+            self.add_user(
+                name, groups=groups, create_groups=create_groups, **kwargs
+            )
 
-        # Set password if plain-text password provided and non-empty
-        if "plain_text_passwd" in kwargs and kwargs["plain_text_passwd"]:
-            self.set_passwd(name, kwargs["plain_text_passwd"])
+        has_existing_password = False
+        ud_blank_password_specified = False
+        ud_password_specified = False
+        password_key = None
 
-        # Set password if hashed password is provided and non-empty
-        if "hashed_passwd" in kwargs and kwargs["hashed_passwd"]:
-            self.set_passwd(name, kwargs["hashed_passwd"], hashed=True)
+        if "plain_text_passwd" in kwargs:
+            ud_password_specified = True
+            password_key = "plain_text_passwd"
+            if kwargs["plain_text_passwd"]:
+                # Set password if plain-text password provided and non-empty
+                self.set_passwd(name, kwargs["plain_text_passwd"])
+            else:
+                ud_blank_password_specified = True
 
-        # Default locking down the account.  'lock_passwd' defaults to True.
-        # lock account unless lock_password is False.
+        if "hashed_passwd" in kwargs:
+            ud_password_specified = True
+            password_key = "hashed_passwd"
+            if kwargs["hashed_passwd"]:
+                # Set password if hashed password is provided and non-empty
+                self.set_passwd(name, kwargs["hashed_passwd"], hashed=True)
+            else:
+                ud_blank_password_specified = True
+
+        if pre_existing_user:
+            if not ud_password_specified:
+                if "passwd" in kwargs:
+                    password_key = "passwd"
+                    # Only "plain_text_passwd" and "hashed_passwd"
+                    # are valid for an existing user.
+                    log_with_downgradable_level(
+                        logger=LOG,
+                        version="24.3",
+                        requested_level=logging.WARNING,
+                        msg="'passwd' in user-data is ignored "
+                        "for existing user %s",
+                        args=(name,),
+                    )
+
+                # As no password specified for the existing user in user-data
+                # then check if the existing user's hashed password value is
+                # empty (whether locked or not).
+                has_existing_password = not (
+                    self._shadow_file_has_empty_user_password(name)
+                )
+        else:
+            if "passwd" in kwargs:
+                ud_password_specified = True
+                password_key = "passwd"
+                if not kwargs["passwd"]:
+                    ud_blank_password_specified = True
+
+        # Default locking down the account. 'lock_passwd' defaults to True.
+        # Lock account unless lock_password is False in which case unlock
+        # account as long as a password (blank or otherwise) was specified.
         if kwargs.get("lock_passwd", True):
             self.lock_passwd(name)
+        elif has_existing_password or ud_password_specified:
+            # 'lock_passwd: False' and either existing account already with
+            # non-blank password or else existing/new account with password
+            # explicitly set in user-data.
+            if ud_blank_password_specified:
+                LOG.debug(
+                    "Allowing unlocking empty password for %s based on empty"
+                    " '%s' in user-data",
+                    name,
+                    password_key,
+                )
+
+            # Unlock the existing/new account
+            self.unlock_passwd(name)
+        elif pre_existing_user:
+            # Pre-existing user with no existing password and none
+            # explicitly set in user-data.
+            log_with_downgradable_level(
+                logger=LOG,
+                version="24.3",
+                requested_level=logging.WARNING,
+                msg="Not unlocking blank password for existing user %s."
+                " 'lock_passwd: false' present in user-data but no existing"
+                " password set and no 'plain_text_passwd'/'hashed_passwd'"
+                " provided in user-data",
+                args=(name,),
+            )
+        else:
+            # No password (whether blank or otherwise) explicitly set
+            log_with_downgradable_level(
+                logger=LOG,
+                version="24.3",
+                requested_level=logging.WARNING,
+                msg="Not unlocking password for user %s. 'lock_passwd: false'"
+                " present in user-data but no 'passwd'/'plain_text_passwd'/"
+                "'hashed_passwd' provided in user-data",
+                args=(name,),
+            )
 
         # Configure doas access
         if "doas" in kwargs:
@@ -836,10 +1089,10 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
             if kwargs["sudo"]:
                 self.write_sudo_rules(name, kwargs["sudo"])
             elif kwargs["sudo"] is False:
-                util.deprecate(
+                lifecycle.deprecate(
                     deprecated=f"The value of 'false' in user {name}'s "
                     "'sudo' config",
-                    deprecated_version="22.3",
+                    deprecated_version="22.2",
                     extra_message="Use 'null' instead.",
                 )
 
@@ -867,8 +1120,9 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
             cloud_keys = kwargs.get("cloud_public_ssh_keys", [])
             if not cloud_keys:
                 LOG.warning(
-                    "Unable to disable SSH logins for %s given"
-                    " ssh_redirect_user: %s. No cloud public-keys present.",
+                    "Unable to disable SSH logins for %s."
+                    " ssh_redirect_user was set to redirect logins to"
+                    " %s, but no cloud public-keys are present.",
                     name,
                     kwargs["ssh_redirect_user"],
                 )
@@ -880,7 +1134,6 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
                 ssh_util.setup_user_keys(
                     set(cloud_keys), name, options=disable_option
                 )
-        return True
 
     def lock_passwd(self, name):
         """
@@ -897,16 +1150,60 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
             ) from e
         try:
             subp.subp(cmd)
-        except Exception as e:
-            util.logexc(LOG, "Failed to disable password for user %s", name)
-            raise e
+        except subp.ProcessExecutionError:
+            LOG.warning("Failed to disable password for user %s", name)
+            raise
+
+    def unlock_passwd(self, name: str):
+        """
+        Unlock the password of a user, i.e., enable password logins
+        """
+        # passwd must use short '-u' due to SLES11 lacking long form '--unlock'
+        unlock_tools = (["passwd", "-u", name], ["usermod", "--unlock", name])
+        try:
+            cmd = next(tool for tool in unlock_tools if subp.which(tool[0]))
+        except StopIteration as e:
+            raise RuntimeError(
+                "Unable to unlock user account '%s'. No tools available. "
+                "  Tried: %s." % (name, [c[0] for c in unlock_tools])
+            ) from e
+        try:
+            _, err = subp.subp(cmd, rcs=[0, 3])
+        except subp.ProcessExecutionError:
+            LOG.warning("Failed to enable password for user %s", name)
+            raise
+        if err:
+            LOG.debug(
+                "Unlocking password for %s wrote to stderr: %s", name, err
+            )
+        if err and self._shadow_file_has_empty_user_password(name):
+            # Unlocking an empty locked password can require clearing it.
+            passwd_set_tools = (
+                ["passwd", "-d", name],
+                ["usermod", "--password", "''", name],
+            )
+            try:
+                cmd = next(
+                    tool for tool in passwd_set_tools if subp.which(tool[0])
+                )
+            except StopIteration as e:
+                raise RuntimeError(
+                    "Unable to set blank password for user account '%s'. "
+                    "No tools available. "
+                    "  Tried: %s." % (name, [c[0] for c in unlock_tools])
+                ) from e
+            try:
+                subp.subp(cmd)
+            except subp.ProcessExecutionError:
+                LOG.warning("Failed to set blank password for user %s", name)
+                raise
 
     def expire_passwd(self, user):
         try:
             subp.subp(["passwd", "--expire", user])
-        except Exception as e:
-            util.logexc(LOG, "Failed to set 'expire' for %s", user)
-            raise e
+        except subp.ProcessExecutionError:
+            LOG.warning("Failed to set 'expire' for %s", user)
+            raise
 
     def set_passwd(self, user, passwd, hashed=False):
         pass_string = "%s:%s" % (user, passwd)
@@ -914,27 +1211,30 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
 
         if hashed:
             # Need to use the short option name '-e' instead of '--encrypted'
-            # (which would be more descriptive) since SLES 11 doesn't know
-            # about long names.
+            # (which would be more descriptive) since Busybox and SLES 11
+            # chpasswd don't know about long names.
             cmd.append("-e")
 
         try:
             subp.subp(
                 cmd, data=pass_string, logstring="chpasswd for %s" % user
             )
-        except Exception as e:
-            util.logexc(LOG, "Failed to set password for %s", user)
-            raise e
+        except subp.ProcessExecutionError:
+            LOG.warning("Failed to set password for %s", user)
+            raise
 
         return True
 
-    def chpasswd(self, plist_in: list, hashed: bool):
+    def chpasswd(self, plist_in: List[Tuple[str, str]], hashed: bool):
         payload = (
             "\n".join(
                 (":".join([name, password]) for name, password in plist_in)
             )
             + "\n"
         )
+        # Need to use the short option name '-e' instead of '--encrypted'
+        # (which would be more descriptive) since Busybox and SLES 11
+        # chpasswd don't know about long names.
         cmd = ["chpasswd"] + (["-e"] if hashed else [])
         subp.subp(cmd, data=payload)
 
@@ -1011,9 +1311,12 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         # it actually exists as a directory
         sudoers_contents = ""
         base_exists = False
+        system_sudo_base = "/usr/etc/sudoers"
         if os.path.exists(sudo_base):
             sudoers_contents = util.load_text_file(sudo_base)
             base_exists = True
+        elif os.path.exists(system_sudo_base):
+            sudoers_contents = util.load_text_file(system_sudo_base)
         found_include = False
         for line in sudoers_contents.splitlines():
             line = line.strip()
@@ -1031,14 +1334,18 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
             try:
                 if not base_exists:
                     lines = [
-                        "# See sudoers(5) for more information"
-                        ' on "#include" directives:',
+                        (
+                            "# See sudoers(5) for more information"
+                            ' on "#include" directives:'
+                        ),
                         "",
                         util.make_header(base="added"),
                         "#includedir %s" % (path),
                         "",
                     ]
-                    sudoers_contents = "\n".join(lines)
+                    if sudoers_contents:
+                        LOG.info("Using content from '%s'", system_sudo_base)
+                    sudoers_contents += "\n".join(lines)
                     util.write_file(sudo_base, sudoers_contents, 0o440)
                 else:
                     lines = [
@@ -1110,8 +1417,8 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
             try:
                 subp.subp(group_add_cmd)
                 LOG.info("Created new group %s", name)
-            except Exception:
-                util.logexc(LOG, "Failed to create group %s", name)
+            except subp.ProcessExecutionError:
+                LOG.warning("Failed to create group %s", name)
 
         # Add members to the group, if so defined
         if len(members) > 0:
@@ -1128,21 +1435,29 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
                 subp.subp(["usermod", "-a", "-G", name, member])
                 LOG.info("Added user '%s' to group '%s'", member, name)
 
-    def shutdown_command(self, *, mode, delay, message):
-        # called from cc_power_state_change.load_power_state
-        command = ["shutdown", self.shutdown_options_map[mode]]
+    @classmethod
+    def shutdown_command(
+        cls, *, mode: str, delay: Union[int, str], message: str
+    ) -> List[str]:
         try:
-            if delay != "now":
-                delay = "+%d" % int(delay)
+            shutdown_delay: str = (
+                str(delay) if delay == "now" else "+%d" % int(delay)
+            )
         except ValueError as e:
             raise TypeError(
                 "power_state[delay] must be 'now' or '+m' (minutes)."
                 " found '%s'." % (delay,)
             ) from e
-        args = command + [delay]
+        return cls._build_shutdown_command(mode, shutdown_delay, message)
+
+    @classmethod
+    def _build_shutdown_command(
+        cls, mode: str, delay: str, message: str
+    ) -> List[str]:
+        command = ["shutdown", cls.shutdown_options_map[mode], delay]
         if message:
-            args.append(message)
-        return args
+            command.append(message)
+        return command
 
     @classmethod
     def reload_init(cls, rcs=None):
@@ -1150,10 +1465,7 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         Reload systemd startup daemon.
         May raise ProcessExecutionError
         """
-        init_cmd = cls.init_cmd
-        if cls.uses_systemd() or "systemctl" in init_cmd:
-            cmd = [init_cmd, "daemon-reload"]
-            return subp.subp(cmd, capture=True, rcs=rcs)
+        return None
 
     @classmethod
     def manage_service(
@@ -1175,7 +1487,7 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
                 "disable": ["disable", service],
                 "restart": ["restart", service],
                 "reload": ["reload-or-restart", service],
-                "try-reload": ["reload-or-try-restart", service],
+                "try-reload": ["try-reload-or-restart", service],
                 "status": ["status", service],
             }
         else:
@@ -1189,7 +1501,7 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
                 "try-reload": [service, "restart"],
                 "status": [service, "status"],
             }
-        cmd = list(init_cmd) + list(cmds[action])
+        cmd = init_cmd + cmds[action] + list(extra_args)
         return subp.subp(cmd, capture=True, rcs=rcs)
 
     def set_keymap(self, layout: str, model: str, variant: str, options: str):
@@ -1229,7 +1541,9 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
                 "-",
                 user,
                 "-c",
-                directory + "env PATH=$PATH " + " ".join(command),
+                directory
+                + "env PATH=$PATH "
+                + " ".join(shlex.quote(arg) for arg in command),
             ],
             **kwargs,
         )
@@ -1392,6 +1706,34 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         # name in /dev/
         return diskdevpath, ptnum
 
+    def wait_for_network(self) -> None:
+        """Ensure that cloud-init has network connectivity.
+
+        For most distros, this is a no-op as cloud-init's network service is
+        ordered in boot to start after network connectivity has been achieved.
+        As an optimization, distros may opt to order cloud-init's network
+        service immediately after cloud-init's local service, and only
+        require network connectivity if it has been deemed necessary.
+        This method is a hook for distros to implement this optimization.
+        It is called during cloud-init's network stage if it was determined
+        that network connectivity is necessary in cloud-init's network stage.
+        """
+
+
+def _get_elevated_roles(
+    *,
+    sudo: Optional[Union[bool, str, List[str]]] = None,
+    doas: Optional[Union[bool, str, List[str]]] = None,
+    **kwargs,
+) -> List[str]:
+    """Return a list of elevated roles provided as keyword arguments."""
+    elevated_roles = []
+    if sudo:
+        elevated_roles.append("sudo")
+    if doas:
+        elevated_roles.append("doas")
+    return elevated_roles
+
 
 def _apply_hostname_transformations_to_url(url: str, transformations: list):
     """
@@ -1510,7 +1852,12 @@ def _get_package_mirror_info(
 
         # ec2 availability zones are named cc-direction-[0-9][a-d] (us-east-1b)
         # the region is us-east-1. so region = az[0:-1]
-        if _EC2_AZ_RE.match(data_source.availability_zone):
+        # This is a best guess regex, based on current EC2 AZs on 2017-12-11.
+        # It could break when Amazon adds new regions and new AZs.
+        if re.match(
+            "^[a-z][a-z]-(?:[a-z]+-)+[0-9][a-z]$",
+            data_source.availability_zone,
+        ):
             ec2_region = data_source.availability_zone[0:-1]
 
             if ALLOW_EC2_MIRRORS_ON_NON_AWS_INSTANCE_TYPES:
@@ -1560,6 +1907,11 @@ def _get_arch_package_mirror_info(package_mirrors, arch):
 
 def fetch(name: str) -> Type[Distro]:
     locs, looked_locs = importer.find_module(name, ["", __name__], ["Distro"])
+    if not locs:
+        # Some distros may have a `-` in the name but an `_` in the module
+        locs, _ = importer.find_module(
+            name.replace("-", "_"), ["", __name__], ["Distro"]
+        )
     if not locs:
         raise ImportError(
             "No distribution found for distro %s (searched %s)"

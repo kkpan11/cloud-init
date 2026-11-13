@@ -5,14 +5,23 @@ import logging
 import os
 import re
 import time
-from typing import Any, Iterable, List, Mapping, Optional, Sequence, cast
+from typing import (
+    Any,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+    cast,
+)
 
 from cloudinit import helpers, subp, util
 from cloudinit.distros.package_management.package_manager import (
     PackageManager,
     UninstalledPackages,
 )
-from cloudinit.settings import PER_INSTANCE
+from cloudinit.settings import PER_ALWAYS, PER_INSTANCE
 
 LOG = logging.getLogger(__name__)
 
@@ -81,7 +90,7 @@ class Apt(PackageManager):
         apt_get_wrapper_command: Sequence[str] = (),
         apt_get_command: Optional[Sequence[str]] = None,
         apt_get_upgrade_subcommand: Optional[str] = None,
-    ):
+    ) -> None:
         super().__init__(runner)
         if apt_get_command is None:
             self.apt_get_command = APT_GET_COMMAND
@@ -108,25 +117,59 @@ class Apt(PackageManager):
     def available(self) -> bool:
         return bool(subp.which(self.apt_get_command[0]))
 
-    def update_package_sources(self):
+    def update_package_sources(self, *, force: bool = False) -> None:
         self.runner.run(
             "update-sources",
             self.run_package_command,
             ["update"],
-            freq=PER_INSTANCE,
+            freq=PER_ALWAYS if force else PER_INSTANCE,
         )
 
     @functools.lru_cache(maxsize=1)
-    def get_all_packages(self):
-        resp: str = subp.subp(["apt-cache", "pkgnames"]).stdout
+    def get_all_packages(self) -> Iterable[str]:
+        """Return the set of all package names known to apt.
+
+        `apt-cache pkgnames` only reports packages for the primary
+        architecture. Packages available only under a foreign architecture
+        (enabled via `dpkg --add-architecture`, e.g. i386 on amd64) are absent
+        from this list. Query each foreign architecture and join the results
+        so multi-arch packages are not wrongly reported as unavailable.
+        """
+        packages = set(
+            subp.subp(["apt-cache", "pkgnames"]).stdout.splitlines()
+        )
+
+        try:
+            foreign_archs = subp.subp(
+                ["dpkg", "--print-foreign-architectures"]
+            ).stdout.splitlines()
+        except subp.ProcessExecutionError:
+            return packages
+
+        for arch in foreign_archs:
+            arch = arch.strip()
+            if not arch:
+                continue
+            try:
+                arch_packages = subp.subp(
+                    [
+                        "apt-cache",
+                        "-o",
+                        f"APT::Architecture={arch}",
+                        "pkgnames",
+                    ]
+                ).stdout
+            except subp.ProcessExecutionError:
+                continue
+            packages.update(arch_packages.splitlines())
 
         # Searching the string directly and searching a list are both
         # linear searches. Converting to a set takes some extra up front
         # time, but resulting searches become binary searches and are much
         # faster
-        return set(resp.splitlines())
+        return packages
 
-    def get_unavailable_packages(self, pkglist: Iterable[str]):
+    def get_unavailable_packages(self, pkglist: Iterable[str]) -> List[str]:
         # Packages ending with `-` signify to apt to not install a transitive
         # dependency.
         # Packages ending with '^' signify to apt to install a Task.
@@ -140,7 +183,7 @@ class Apt(PackageManager):
             not in self.get_all_packages()
         ]
 
-    def install_packages(self, pkglist: Iterable) -> UninstalledPackages:
+    def install_packages(self, pkglist: Iterable[str]) -> UninstalledPackages:
         self.update_package_sources()
         pkglist = util.expand_package_list("%s=%s", list(pkglist))
         unavailable = self.get_unavailable_packages(
@@ -157,7 +200,12 @@ class Apt(PackageManager):
             self.run_package_command("install", pkgs=to_install)
         return unavailable
 
-    def run_package_command(self, command, args=None, pkgs=None):
+    def run_package_command(
+        self,
+        command: str,
+        args: Optional[Union[str, List[str]]] = None,
+        pkgs: Optional[List[str]] = None,
+    ) -> None:
         if pkgs is None:
             pkgs = []
         full_command = list(self.apt_command)
@@ -174,7 +222,6 @@ class Apt(PackageManager):
         full_command.extend(pkglist)
 
         self._wait_for_apt_command(
-            short_cmd=command,
             subp_kwargs={
                 "args": full_command,
                 "update_env": self.environment,
@@ -182,14 +229,12 @@ class Apt(PackageManager):
             },
         )
 
-    def _apt_lock_available(self, lock_files=None):
+    def _apt_lock_available(self) -> bool:
         """Determines if another process holds any apt locks.
 
         If all locks are clear, return True else False.
         """
-        if lock_files is None:
-            lock_files = APT_LOCK_FILES
-        for lock in lock_files:
+        for lock in APT_LOCK_FILES:
             if not os.path.exists(lock):
                 # Only wait for lock files that already exist
                 continue
@@ -201,29 +246,23 @@ class Apt(PackageManager):
         return True
 
     def _wait_for_apt_command(
-        self, short_cmd, subp_kwargs, timeout=APT_LOCK_WAIT_TIMEOUT
-    ):
+        self,
+        subp_kwargs: Mapping[str, Any],
+        timeout: int = APT_LOCK_WAIT_TIMEOUT,
+    ) -> subp.SubpResult:
         """Wait for apt install to complete.
 
-        short_cmd: Name of command like "upgrade" or "install"
         subp_kwargs: kwargs to pass to subp
         """
-        start_time = time.time()
+        start_time = time.monotonic()
         LOG.debug("Waiting for APT lock")
-        while time.time() - start_time < timeout:
+        while time.monotonic() - start_time < timeout:
             if not self._apt_lock_available():
                 time.sleep(1)
                 continue
             LOG.debug("APT lock available")
             try:
-                # Allow the output of this to flow outwards (not be captured)
-                log_msg = f'apt-{short_cmd} [{" ".join(subp_kwargs["args"])}]'
-                return util.log_time(
-                    logfunc=LOG.debug,
-                    msg=log_msg,
-                    func=subp.subp,
-                    kwargs=subp_kwargs,
-                )
+                return subp.subp(**subp_kwargs)
             except subp.ProcessExecutionError:
                 # Even though we have already waited for the apt lock to be
                 # available, it is possible that the lock was acquired by

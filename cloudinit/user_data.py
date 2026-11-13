@@ -230,9 +230,9 @@ class UserDataProcessor:
             content = None
             if include_once_on:
                 include_once_fn = self._get_include_once_filename(include_url)
-            if include_once_on and os.path.isfile(include_once_fn):
-                content = util.load_text_file(include_once_fn)
-            else:
+                if os.path.isfile(include_once_fn):
+                    content = util.load_text_file(include_once_fn)
+            if content is None:
                 try:
                     resp = read_file_or_url(
                         include_url,
@@ -295,6 +295,7 @@ class UserDataProcessor:
                 mtype = handlers.type_from_starts_with(content, default)
 
             maintype, subtype = mtype.split("/", 1)
+            msg: MIMEBase
             if maintype == "text":
                 if isinstance(content, bytes):
                     content = content.decode()
@@ -361,7 +362,7 @@ def is_skippable(part):
     return False
 
 
-# Coverts a raw string into a mime message
+# Converts a raw string into a mime message
 def convert_string(raw_data, content_type=NOT_MULTIPART_TYPE):
     """convert a string (more likely bytes) or a message into
     a mime message."""

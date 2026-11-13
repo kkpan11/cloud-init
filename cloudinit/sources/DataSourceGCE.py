@@ -18,7 +18,6 @@ LOG = logging.getLogger(__name__)
 
 MD_V1_URL = "http://metadata.google.internal/computeMetadata/v1/"
 BUILTIN_DS_CONFIG = {"metadata_url": MD_V1_URL}
-REQUIRED_FIELDS = ("instance-id", "availability-zone", "local-hostname")
 GUEST_ATTRIBUTES_URL = (
     "http://metadata.google.internal/computeMetadata/"
     "v1/instance/guest-attributes"
@@ -26,6 +25,15 @@ GUEST_ATTRIBUTES_URL = (
 HOSTKEY_NAMESPACE = "hostkeys"
 HEADERS = {"Metadata-Flavor": "Google"}
 DEFAULT_PRIMARY_INTERFACE = "ens4"
+
+# Board names (from DMI baseboard-product-name) for GCE platforms known to
+# exhibit a NIC initialization race condition where kernel network drivers
+# are not ready when cloud-init-local runs. Polling for NICs is restricted
+# to these board names to avoid unnecessary boot delays on other instances.
+# Addresses GH-6737.
+NETWORK_POLLING_BOARD_ALLOW_LIST = [
+    "izumi",  # c3-metal
+]
 
 
 class GoogleMetadataFetcher:
@@ -75,8 +83,8 @@ class DataSourceGCE(sources.DataSource):
         sources.DataSource.__init__(self, sys_cfg, distro, paths)
         self.default_user = None
         if distro:
-            (users, _groups) = ug_util.normalize_users_groups(sys_cfg, distro)
-            (self.default_user, _user_config) = ug_util.extract_default(users)
+            users, _groups = ug_util.normalize_users_groups(sys_cfg, distro)
+            self.default_user, _user_config = ug_util.extract_default(users)
         self.metadata = dict()
         self.ds_cfg = util.mergemanydict(
             [
@@ -88,15 +96,28 @@ class DataSourceGCE(sources.DataSource):
 
     def _get_data(self):
         url_params = self.get_url_params()
+        ret = {}
         if self.perform_dhcp_setup:
-            candidate_nics = net.find_candidate_nics()
+            board_name = dmi.read_dmi_data("baseboard-product-name")
+            wait_for_nics = (
+                board_name is not None
+                and board_name.lower() in NETWORK_POLLING_BOARD_ALLOW_LIST
+            )
+            if wait_for_nics:
+                candidate_nics = net.wait_for_candidate_nics(
+                    timeout=60, sleep_interval=1
+                )
+            else:
+                candidate_nics = net.find_candidate_nics()
+            # Abort if NICs are still unavailable
+            # (whether retry was attempted or skipped).
+            if not candidate_nics:
+                LOG.error("The instance must have at least one eligible NIC")
+                return False
             if DEFAULT_PRIMARY_INTERFACE in candidate_nics:
                 candidate_nics.remove(DEFAULT_PRIMARY_INTERFACE)
                 candidate_nics.insert(0, DEFAULT_PRIMARY_INTERFACE)
             LOG.debug("Looking for the primary NIC in: %s", candidate_nics)
-            assert (
-                len(candidate_nics) >= 1
-            ), "The instance has to have at least one candidate NIC"
             for candidate_nic in candidate_nics:
                 network_context = EphemeralDHCPv4(
                     self.distro,
@@ -105,14 +126,9 @@ class DataSourceGCE(sources.DataSource):
                 try:
                     with network_context:
                         try:
-                            ret = util.log_time(
-                                LOG.debug,
-                                "Crawl of GCE metadata service",
-                                read_md,
-                                kwargs={
-                                    "address": self.metadata_address,
-                                    "url_params": url_params,
-                                },
+                            ret = read_md(
+                                address=self.metadata_address,
+                                url_params=url_params,
                             )
                         except Exception as e:
                             LOG.debug(
@@ -122,6 +138,9 @@ class DataSourceGCE(sources.DataSource):
                             )
                             continue
                 except NoDHCPLeaseError:
+                    LOG.debug(
+                        "Unable to obtain a DHCP lease for %s", candidate_nic
+                    )
                     continue
                 if ret["success"]:
                     self.distro.fallback_interface = candidate_nic
@@ -132,24 +151,16 @@ class DataSourceGCE(sources.DataSource):
                     "Did not find a fallback interface on %s.", self.cloud_name
                 )
         else:
-            ret = util.log_time(
-                LOG.debug,
-                "Crawl of GCE metadata service",
-                read_md,
-                kwargs={
-                    "address": self.metadata_address,
-                    "url_params": url_params,
-                },
-            )
+            ret = read_md(address=self.metadata_address, url_params=url_params)
 
-        if not ret["success"]:
-            if ret["platform_reports_gce"]:
-                LOG.warning(ret["reason"])
+        if not ret.get("success"):
+            if ret.get("platform_reports_gce"):
+                LOG.warning(ret.get("reason"))
             else:
-                LOG.debug(ret["reason"])
+                LOG.debug(ret.get("reason"))
             return False
-        self.metadata = ret["meta-data"]
-        self.userdata_raw = ret["user-data"]
+        self.metadata = ret.get("meta-data")
+        self.userdata_raw = ret.get("user-data")
         return True
 
     @property
@@ -227,14 +238,14 @@ def _has_expired(public_key):
         return False
 
     expire_str = json_obj["expireOn"]
-    format_str = "%Y-%m-%dT%H:%M:%S+0000"
+    format_str = "%Y-%m-%dT%H:%M:%S%z"
     try:
         expire_time = datetime.datetime.strptime(expire_str, format_str)
     except ValueError:
         return False
 
     # Expire the key if and only if we have exceeded the expiration timestamp.
-    return datetime.datetime.utcnow() > expire_time
+    return datetime.datetime.now(datetime.timezone.utc) > expire_time
 
 
 def _parse_public_keys(public_keys_data, default_user=None):
@@ -293,7 +304,7 @@ def read_md(address=None, url_params=None, platform_check=True):
     )
     md = {}
     # Iterate over url_map keys to get metadata items.
-    for (mkey, paths, required, is_text, is_recursive) in url_map:
+    for mkey, paths, required, is_text, is_recursive in url_map:
         value = None
         for path in paths:
             new_value = metadata_fetcher.get_value(path, is_text, is_recursive)
@@ -327,6 +338,12 @@ def read_md(address=None, url_params=None, platform_check=True):
         elif encoding:
             LOG.warning("unknown user-data-encoding: %s, ignoring", encoding)
         ret["user-data"] = ud
+
+    # Update md with parsed instance-data
+    md["instance-data"] = instance_data
+
+    # Update md with parsed project-data
+    md["project-data"] = project_data
 
     ret["meta-data"] = md
     ret["success"] = True

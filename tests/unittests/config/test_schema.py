@@ -8,21 +8,18 @@ import logging
 import os
 import re
 import sys
-import unittest
 from collections import namedtuple
-from copy import deepcopy
 from errno import EACCES
 from pathlib import Path
 from textwrap import dedent
 from types import ModuleType
-from typing import List, Optional, Sequence, Set
+from typing import List
 
 import pytest
 import yaml
 
+from cloudinit import features, performance
 from cloudinit.config.schema import (
-    VERSIONED_USERDATA_SCHEMA_FILE,
-    MetaSchema,
     SchemaProblem,
     SchemaType,
     SchemaValidationError,
@@ -32,7 +29,6 @@ from cloudinit.config.schema import (
     get_schema,
     get_schema_dir,
     handle_schema_args,
-    load_doc,
     main,
     netplan_validate_network_schema,
     validate_cloudconfig_file,
@@ -46,19 +42,16 @@ from cloudinit.sources import DataSourceNotFoundException
 from cloudinit.templater import JinjaSyntaxParsingException
 from cloudinit.util import load_text_file, write_file
 from tests.helpers import cloud_init_project_dir
-from tests.hypothesis import given
-from tests.hypothesis_jsonschema import from_schema
 from tests.unittests.helpers import (
-    CiTestCase,
     does_not_raise,
     mock,
-    skipUnlessHypothesisJsonSchema,
     skipUnlessJsonSchema,
     skipUnlessJsonSchemaVersionGreaterThan,
 )
 
 M_PATH = "cloudinit.config.schema."
 DEPRECATED_LOG_LEVEL = 35
+VERSIONED_USERDATA_SCHEMA_FILE = "versions.schema.cloud-config.json"
 
 
 def get_schemas() -> dict:
@@ -154,7 +147,7 @@ class TestVersionedSchemas:
             )
 
 
-class TestCheckSchema(unittest.TestCase):
+class TestCheckSchema:
     def test_schema_bools_have_dates(self):
         """ensure that new/changed/deprecated keys have an associated
         version key
@@ -184,13 +177,13 @@ class TestCheckSchema(unittest.TestCase):
             },
             "new",
         )
-        with self.assertRaises(AssertionError):
+        with pytest.raises(AssertionError):
             check_deprecation_keys({"changed": True}, "changed")
-        with self.assertRaises(AssertionError):
+        with pytest.raises(AssertionError):
             check_deprecation_keys(
                 {"properties": {"deprecated": True}}, "deprecated"
             )
-        with self.assertRaises(AssertionError):
+        with pytest.raises(AssertionError):
             check_deprecation_keys(
                 {"properties": {"properties": {"new": True}}}, "new"
             )
@@ -255,6 +248,7 @@ class TestGetSchema:
             {"$ref": "#/$defs/cc_phone_home"},
             {"$ref": "#/$defs/cc_power_state_change"},
             {"$ref": "#/$defs/cc_puppet"},
+            {"$ref": "#/$defs/cc_raspberry_pi"},
             {"$ref": "#/$defs/cc_resizefs"},
             {"$ref": "#/$defs/cc_resolv_conf"},
             {"$ref": "#/$defs/cc_rh_subscription"},
@@ -297,20 +291,34 @@ class TestGetSchema:
         assert [] == sorted(legacy_schema_keys)
 
 
-class TestLoadDoc:
-    docs = get_module_variable("__doc__")
+MODULE_DATA_YAML_TMPL = """\
+{mod_id}:
+  name: {name}
+  title: My Module
+  description:
+    My amazing module description
+  examples:
+  - comment: "comment 1"
+    file: {examplefile}
+"""
 
-    @pytest.mark.parametrize(
-        "module_name",
-        ("cc_apt_pipelining",),  # new style composite schema file
-    )
-    def test_report_docs_consolidated_schema(self, module_name):
-        doc = load_doc([module_name])
-        assert doc, "Unexpected empty docs for {}".format(module_name)
-        assert self.docs[module_name] == doc
+
+class TestModuleDocs:
+    def test_validate_data_file_schema(self, mocker, paths):
+        mocker.patch(M_PATH + "read_cfg_paths", return_value=paths)
+        root_dir = Path(__file__).parent.parent.parent.parent
+        for mod_data_f in root_dir.glob("doc/module-docs/*/data.yaml"):
+            docs_metadata = yaml.safe_load(mod_data_f.read_text())
+            assert docs_metadata.get(mod_data_f.parent.stem), (
+                f"Top-level key in {mod_data_f} doesn't match"
+                f" {mod_data_f.parent.stem}"
+            )
+            assert ["description", "examples", "name", "title"] == sorted(
+                docs_metadata[mod_data_f.parent.stem].keys()
+            )
 
 
-class SchemaValidationErrorTest(CiTestCase):
+class SchemaValidationErrorTest:
     """Test validate_cloudconfig_schema"""
 
     def test_schema_validation_error_expects_schema_errors(self):
@@ -322,14 +330,14 @@ class SchemaValidationErrorTest(CiTestCase):
             ),
         ]
         exception = SchemaValidationError(schema_errors=errors)
-        self.assertIsInstance(exception, Exception)
-        self.assertEqual(exception.schema_errors, errors)
-        self.assertEqual(
+        assert isinstance(exception, Exception)
+        assert exception.schema_errors == errors
+        assert (
             'Cloud config schema errors: key.path: unexpected key "junk", '
-            'key2.path: "-123" is not a valid "hostname" format',
-            str(exception),
+            'key2.path: "-123" is not a valid "hostname" format'
+            == str(exception)
         )
-        self.assertTrue(isinstance(exception, ValueError))
+        assert isinstance(exception, ValueError)
 
 
 class FakeNetplanParserException(Exception):
@@ -355,21 +363,20 @@ class TestNetplanValidateNetworkSchema:
             ({"version": 1}, ""),
             (
                 {"version": 2},
-                "Skipping netplan schema validation. No netplan available",
+                "Skipping netplan schema validation. No netplan API available",
             ),
             (
                 {"network": {"version": 2}},
-                "Skipping netplan schema validation. No netplan available",
+                "Skipping netplan schema validation. No netplan API available",
             ),
         ),
     )
     def test_network_config_schema_validation_false_when_skipped(
-        self, config, expected_log, caplog
+        self, config, expected_log, caplog, mocker
     ):
         """netplan_validate_network_schema returns false when skipped."""
-        with mock.patch.dict("sys.modules"):
-            sys.modules.pop("netplan", None)
-            assert False is netplan_validate_network_schema(config)
+        mocker.patch(f"{M_PATH}LIBNETPLAN_AVAILABLE", False)
+        assert False is netplan_validate_network_schema(config)
         assert expected_log in caplog.text
 
     @pytest.mark.parametrize(
@@ -383,15 +390,17 @@ class TestNetplanValidateNetworkSchema:
                     column=12,
                     message="incorrect YAML value: yes for dhcp value",
                 ),
-                r"Invalid network-config provided:.*format-l1.c12: Invalid"
-                " netplan schema. incorrect YAML value: yes for dhcp value",
+                (
+                    r"network-config failed schema validation!.*format-l1.c12:"
+                    " Invalid netplan schema. incorrect YAML value: yes for"
+                    " dhcp value"
+                ),
             ),
         ),
     )
     def test_network_config_schema_validation(
-        self, error, error_log, caplog, tmpdir
+        self, error, error_log, caplog, tmpdir, mocker
     ):
-
         fake_tmpdir = tmpdir.join("mkdtmp")
 
         class FakeParser:
@@ -402,21 +411,21 @@ class TestNetplanValidateNetworkSchema:
                     raise error
 
         # Mock expected imports
-        with mock.patch.dict(
-            "sys.modules",
-            netplan=mock.MagicMock(
-                NetplanParserException=FakeNetplanParserException,
-                Parser=FakeParser,
-            ),
-        ):
-            with mock.patch(
-                "cloudinit.config.schema.mkdtemp",
-                return_value=fake_tmpdir.strpath,
-            ):
-                with caplog.at_level(logging.WARNING):
-                    assert netplan_validate_network_schema({"version": 2})
-            if error_log:
-                assert re.match(error_log, caplog.records[0].msg, re.DOTALL)
+        mocker.patch(f"{M_PATH}LIBNETPLAN_AVAILABLE", True)
+        mocker.patch(
+            f"{M_PATH}NetplanParserException",
+            FakeNetplanParserException,
+            create=True,
+        )
+        mocker.patch(f"{M_PATH}Parser", FakeParser, create=True)
+        mocker.patch(
+            "cloudinit.config.schema.mkdtemp",
+            return_value=fake_tmpdir.strpath,
+        )
+        with caplog.at_level(logging.WARNING):
+            assert netplan_validate_network_schema({"version": 2})
+        if error_log:
+            assert re.match(error_log, caplog.records[0].msg, re.DOTALL)
 
 
 class TestValidateCloudConfigSchema:
@@ -444,12 +453,15 @@ class TestValidateCloudConfigSchema:
         """When strict is False validate_cloudconfig_schema emits warnings."""
         schema = {"properties": {"p1": {"type": "string"}}}
         validate_cloudconfig_schema({"p1": -1}, schema=schema, strict=False)
+        assert caplog.record_tuples and (
+            len(caplog.record_tuples) == 1 or len(caplog.record_tuples) == 2
+        ), caplog.record_tuples
         [(module, log_level, log_msg)] = caplog.record_tuples
         assert "cloudinit.config.schema" == module
         assert logging.WARNING == log_level
         assert (
-            "Invalid cloud-config provided:\np1: -1 is not of type 'string'"
-            == log_msg
+            "cloud-config failed schema validation!\n"
+            "p1: -1 is not of type 'string'" == log_msg
         )
 
     @skipUnlessJsonSchema()
@@ -469,8 +481,9 @@ class TestValidateCloudConfigSchema:
         assert "cloudinit.config.schema" == module
         assert logging.WARNING == log_level
         assert (
-            "Invalid cloud-config provided: Please run 'sudo cloud-init "
-            "schema --system' to see the schema errors." == log_msg
+            "cloud-config failed schema validation! You may run "
+            "'sudo cloud-init schema --system' to check the details."
+            == log_msg
         )
 
     @skipUnlessJsonSchema()
@@ -507,6 +520,64 @@ class TestValidateCloudConfigSchema:
         assert "Cloud config schema errors: p1: '-1' is not a 'email'" == (
             str(context_mgr.value)
         )
+
+    @skipUnlessJsonSchema()
+    @pytest.mark.parametrize(
+        "schema,should_succeed_validating,expected_err_msg_of_either_schema_or_its_negation",
+        [
+            (
+                {"required": ["a", "b"]},
+                True,
+                (
+                    "Cloud config schema errors: : ({'a': 5, 'b': 6} should"
+                    r" not be valid under {'required': \['a', 'b'\]}|"
+                    r"{'required': \['a', 'b'\]} is not allowed for"
+                    " {'a': 5, 'b': 6})"
+                ),
+            ),
+            (
+                {"required": ["a", "c"]},
+                False,
+                "Cloud config schema errors: : 'c' is a required property",
+            ),
+            (
+                {"required": ["d", "c"]},
+                False,
+                (
+                    "Cloud config schema errors: : 'c' is a required property,"
+                    " : 'd' is a required property"
+                ),
+            ),
+        ],
+    )
+    def test_validateconfig_with_not_keyword_in_schema(
+        self,
+        schema,
+        should_succeed_validating,
+        expected_err_msg_of_either_schema_or_its_negation,
+    ):
+        """
+        Test the behavior of the not keyword in a schema
+        """
+        cfg_to_test = {"a": 5, "b": 6}
+        not_schema = {"not": schema}
+        schema_to_succeed, schema_to_fail = (
+            (schema, not_schema)
+            if should_succeed_validating
+            else (not_schema, schema)
+        )
+
+        validate_cloudconfig_schema(
+            cfg_to_test, schema_to_succeed, strict=True
+        )
+
+        with pytest.raises(
+            SchemaValidationError,
+            match=expected_err_msg_of_either_schema_or_its_negation,
+        ):
+            validate_cloudconfig_schema(
+                cfg_to_test, schema_to_fail, strict=True
+            )
 
     @skipUnlessJsonSchema()
     def test_validateconfig_schema_honors_formats_strict_metaschema(self):
@@ -562,8 +633,10 @@ class TestValidateCloudConfigSchema:
                     },
                 },
                 {"a-b": "asdf"},
-                "Deprecated cloud-config provided:\na-b: <desc> "
-                "Deprecated in version 22.1.",
+                (
+                    "Deprecated cloud-config provided: a-b: <desc> "
+                    "Deprecated in version 22.1."
+                ),
             ),
             (
                 {
@@ -583,8 +656,10 @@ class TestValidateCloudConfigSchema:
                     },
                 },
                 {"x": "+5"},
-                "Deprecated cloud-config provided:\nx: <desc> "
-                "Deprecated in version 22.1.",
+                (
+                    "Deprecated cloud-config provided: x: <desc> "
+                    "Deprecated in version 22.1."
+                ),
             ),
             (
                 {
@@ -604,8 +679,10 @@ class TestValidateCloudConfigSchema:
                     },
                 },
                 {"x": "5"},
-                "Deprecated cloud-config provided:\nx: <desc> "
-                "Deprecated in version 22.1. <dep desc>",
+                (
+                    "Deprecated cloud-config provided: x: <desc> "
+                    "Deprecated in version 22.1. <dep desc>"
+                ),
             ),
             (
                 {
@@ -625,8 +702,10 @@ class TestValidateCloudConfigSchema:
                     },
                 },
                 {"x": "5"},
-                "Deprecated cloud-config provided:\nx: <desc> "
-                "Deprecated in version 22.1.",
+                (
+                    "Deprecated cloud-config provided: x: <desc> "
+                    "Deprecated in version 22.1."
+                ),
             ),
             (
                 {
@@ -641,8 +720,10 @@ class TestValidateCloudConfigSchema:
                     },
                 },
                 {"x": "+5"},
-                "Deprecated cloud-config provided:\nx: <desc> "
-                "Deprecated in version 22.1.",
+                (
+                    "Deprecated cloud-config provided: x: <desc> "
+                    "Deprecated in version 22.1."
+                ),
             ),
             (
                 {
@@ -678,8 +759,10 @@ class TestValidateCloudConfigSchema:
                     },
                 },
                 {"x": "+5"},
-                "Deprecated cloud-config provided:\nx: <desc> "
-                "Deprecated in version 32.3.",
+                (
+                    "Deprecated cloud-config provided: x: <desc> "
+                    "Deprecated in version 32.3."
+                ),
             ),
             (
                 {
@@ -703,8 +786,10 @@ class TestValidateCloudConfigSchema:
                     },
                 },
                 {"x": "+5"},
-                "Deprecated cloud-config provided:\nx:  Deprecated in "
-                "version 27.2.",
+                (
+                    "Deprecated cloud-config provided: x:  Deprecated in "
+                    "version 27.2."
+                ),
             ),
             (
                 {
@@ -719,8 +804,10 @@ class TestValidateCloudConfigSchema:
                     },
                 },
                 {"a-b": "asdf"},
-                "Deprecated cloud-config provided:\na-b: <desc> "
-                "Deprecated in version 27.2.",
+                (
+                    "Deprecated cloud-config provided: a-b: <desc> "
+                    "Deprecated in version 27.2."
+                ),
             ),
             pytest.param(
                 {
@@ -737,8 +824,8 @@ class TestValidateCloudConfigSchema:
                     },
                 },
                 {"a-b": "asdf"},
-                "Deprecated cloud-config provided:\na-b:  Deprecated "
-                "in version 27.2.\na-b:  Changed in version 22.2. "
+                "Deprecated cloud-config provided: a-b:  Deprecated "
+                "in version 27.2., a-b:  Changed in version 22.2. "
                 "Drop ballast.",
                 id="deprecated_pattern_property_without_description",
             ),
@@ -747,12 +834,15 @@ class TestValidateCloudConfigSchema:
     def test_validateconfig_logs_deprecations(
         self, schema, config, expected_msg, log_deprecations, caplog
     ):
-        validate_cloudconfig_schema(
-            config,
-            schema=schema,
-            strict_metaschema=True,
-            log_deprecations=log_deprecations,
-        )
+        with mock.patch.object(
+            features, "DEPRECATION_INFO_BOUNDARY", "devel"
+        ), mock.patch.object(performance, "Timed"):
+            validate_cloudconfig_schema(
+                config,
+                schema=schema,
+                strict_metaschema=True,
+                log_deprecations=log_deprecations,
+            )
         if expected_msg is None:
             return
         log_record = (M_PATH[:-1], DEPRECATED_LOG_LEVEL, expected_msg)
@@ -923,7 +1013,6 @@ class TestValidateCloudConfigFile:
     def test_validateconfig_file_raises_jinja_syntax_error(
         self, annotate, tmpdir, mocker, capsys
     ):
-        """ """
         # will throw error because of space between last two }'s
         invalid_jinja_template = "## template: jinja\na:b\nc:{{ d } }"
         mocker.patch("os.path.exists", return_value=True)
@@ -955,756 +1044,26 @@ class TestValidateCloudConfigFile:
         assert expected == err
 
 
-class TestSchemaDocMarkdown:
-    """Tests for get_meta_doc."""
-
-    required_schema = {
-        "title": "title",
-        "description": "description",
-        "id": "id",
-        "name": "name",
-        "frequency": "frequency",
-        "distros": ["debian", "rhel"],
-    }
-    meta: MetaSchema = {
-        "title": "title",
-        "description": "description",
-        "id": "id",
-        "name": "name",
-        "frequency": "frequency",
-        "distros": ["debian", "rhel"],
-        "examples": [
-            'prop1:\n    [don\'t, expand, "this"]',
-            "prop2: true",
-        ],
-    }
-
-    @pytest.mark.parametrize(
-        "meta_update",
-        [
-            None,
-            {"activate_by_schema_keys": None},
-            {"activate_by_schema_keys": []},
-        ],
-    )
-    def test_get_meta_doc_returns_restructured_text(self, meta_update):
-        """get_meta_doc returns restructured text for a cloudinit schema."""
-        full_schema = deepcopy(self.required_schema)
-        full_schema.update(
-            {
-                "properties": {
-                    "prop1": {
-                        "type": "array",
-                        "description": "prop-description",
-                        "items": {"type": "integer"},
-                    }
-                }
-            }
-        )
-        meta = deepcopy(self.meta)
-        if meta_update:
-            meta.update(meta_update)
-
-        doc = get_meta_doc(meta, full_schema)
-
-        expected_lines = [
-            "name",
-            "----",
-            "title",
-            ".. tab-set::",
-            "   .. tab-item:: Summary",
-            "      description",
-            "      **Internal name:** ``id``",
-            "      **Module frequency:** frequency",
-            "      **Supported distros:** debian, rhel",
-            "   .. tab-item:: Config schema",
-            "      * **prop1:** (array of integer) prop-description",
-            "   .. tab-item:: Examples",
-            "      ::",
-            "         # --- Example1 ---",
-            "         prop1:",
-            '             [don\'t, expand, "this"]',
-            "         # --- Example2 ---",
-            "         prop2: true",
-        ]
-
-        for line in [ln for ln in doc.splitlines() if ln.strip()]:
-            assert line in expected_lines
-
-    def test_get_meta_doc_full_with_activate_by_schema_keys(self):
-        full_schema = deepcopy(self.required_schema)
-        full_schema.update(
-            {
-                "properties": {
-                    "prop1": {
-                        "type": "array",
-                        "description": "prop-description.",
-                        "items": {"type": "string"},
-                    },
-                    "prop2": {
-                        "type": "boolean",
-                        "description": "prop2-description.",
-                    },
-                },
-            }
-        )
-
-        meta = deepcopy(self.meta)
-        meta["activate_by_schema_keys"] = ["prop1", "prop2"]
-
-        doc = get_meta_doc(meta, full_schema)
-        expected_lines = [
-            "name",
-            "----",
-            "title",
-            ".. tab-set::",
-            "   .. tab-item:: Summary",
-            "      description",
-            "      **Internal name:** ``id``",
-            "      **Module frequency:** frequency",
-            "      **Supported distros:** debian, rhel",
-            "      **Activate only on keys:** ``prop1``, ``prop2``",
-            "   .. tab-item:: Config schema",
-            "      * **prop1:** (array of string) prop-description.",
-            "      * **prop2:** (boolean) prop2-description.",
-            "   .. tab-item:: Examples",
-            "      ::",
-            "         # --- Example1 ---",
-            "         prop1:",
-            '             [don\'t, expand, "this"]',
-            "         # --- Example2 ---",
-            "         prop2: true",
-        ]
-
-        for line in [ln for ln in doc.splitlines() if ln.strip()]:
-            assert line in expected_lines
-
-    def test_get_meta_doc_handles_multiple_types(self):
-        """get_meta_doc delimits multiple property types with a '/'."""
-        schema = {"properties": {"prop1": {"type": ["string", "integer"]}}}
-        assert "**prop1:** (string/integer)" in get_meta_doc(self.meta, schema)
-
-    @pytest.mark.parametrize("multi_key", ["oneOf", "anyOf"])
-    def test_get_meta_doc_handles_multiple_types_recursive(self, multi_key):
-        """get_meta_doc delimits multiple property types with a '/'."""
-        schema = {
-            "properties": {
-                "prop1": {
-                    multi_key: [
-                        {"type": ["string", "null"]},
-                        {"type": "integer"},
-                    ]
-                }
-            }
-        }
-        assert "**prop1:** (string/null/integer)" in get_meta_doc(
-            self.meta, schema
-        )
-
-    def test_references_are_flattened_in_schema_docs(self):
-        """get_meta_doc flattens and renders full schema definitions."""
-        schema = {
-            "$defs": {
-                "flattenit": {
-                    "type": ["object", "string"],
-                    "description": "Objects support the following keys:",
-                    "patternProperties": {
-                        "^.+$": {
-                            "label": "<opaque_label>",
-                            "description": "List of cool strings.",
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "minItems": 1,
-                        }
-                    },
-                }
-            },
-            "properties": {"prop1": {"$ref": "#/$defs/flattenit"}},
-        }
-        expected_lines = [
-            "**prop1:** (string/object) Objects support the following keys",
-            "**<opaque_label>:** (array of string) List of cool strings.",
-        ]
-        doc = get_meta_doc(self.meta, schema)
-        for line in expected_lines:
-            assert line in doc
-
-    @pytest.mark.parametrize(
-        "sub_schema,expected",
-        (
-            (
-                {"enum": [True, False, "stuff"]},
-                "**prop1:** (``true``/``false``/``stuff``)",
-            ),
-            # When type: string and enum, document enum values
-            (
-                {"type": "string", "enum": ["a", "b"]},
-                "**prop1:** (``a``/``b``)",
-            ),
-        ),
-    )
-    def test_get_meta_doc_handles_enum_types(self, sub_schema, expected):
-        """get_meta_doc converts enum types to yaml and delimits with '/'."""
-        schema = {"properties": {"prop1": sub_schema}}
-        assert expected in get_meta_doc(self.meta, schema)
-
-    @pytest.mark.parametrize(
-        "schema,expected",
-        (
-            pytest.param(  # Hide top-level keys like 'properties'
-                {
-                    "hidden": ["properties"],
-                    "properties": {
-                        "p1": {"type": "string"},
-                        "p2": {"type": "boolean"},
-                    },
-                    "patternProperties": {
-                        "^.*$": {
-                            "type": "string",
-                            "label": "label2",
-                        }
-                    },
-                },
-                [
-                    "Config schema\n\n",
-                    "      * **label2:** (string)",
-                ],
-                id="top_level_keys",
-            ),
-            pytest.param(  # Hide nested individual keys with a bool
-                {
-                    "properties": {
-                        "p1": {"type": "string", "hidden": True},
-                        "p2": {"type": "boolean"},
-                    }
-                },
-                [
-                    "Config schema\n\n",
-                    "      * **p2:** (boolean)",
-                ],
-                id="nested_keys",
-            ),
-        ),
-    )
-    def test_get_meta_doc_hidden_hides_specific_properties_from_docs(
-        self, schema, expected
-    ):
-        """Docs are hidden for any property in the hidden list.
-
-        Useful for hiding deprecated key schema.
-        """
-        assert "".join(expected) in get_meta_doc(self.meta, schema)
-
-    @pytest.mark.parametrize("multi_key", ["oneOf", "anyOf"])
-    def test_get_meta_doc_handles_nested_multi_schema_property_types(
-        self, multi_key
-    ):
-        """get_meta_doc describes array items oneOf declarations in type."""
-        schema = {
-            "properties": {
-                "prop1": {
-                    "type": "array",
-                    "items": {
-                        multi_key: [{"type": "string"}, {"type": "integer"}]
-                    },
-                }
-            }
-        }
-        assert "**prop1:** (array of (string/integer))" in get_meta_doc(
-            self.meta, schema
-        )
-
-    @pytest.mark.parametrize("multi_key", ["oneOf", "anyOf"])
-    def test_get_meta_doc_handles_types_as_list(self, multi_key):
-        """get_meta_doc renders types which have a list value."""
-        schema = {
-            "properties": {
-                "prop1": {
-                    "type": ["boolean", "array"],
-                    "items": {
-                        multi_key: [{"type": "string"}, {"type": "integer"}]
-                    },
-                }
-            }
-        }
-        assert (
-            "**prop1:** (boolean/array of (string/integer))"
-            in get_meta_doc(self.meta, schema)
-        )
-
-    def test_get_meta_doc_handles_flattening_defs(self):
-        """get_meta_doc renders $defs."""
-        schema = {
-            "$defs": {
-                "prop1object": {
-                    "type": "object",
-                    "properties": {"subprop": {"type": "string"}},
-                }
-            },
-            "properties": {"prop1": {"$ref": "#/$defs/prop1object"}},
-        }
-        assert (
-            "* **prop1:** (object)\n\n        * **subprop:** (string)\n"
-            in get_meta_doc(self.meta, schema)
-        )
-
-    def test_get_meta_doc_handles_string_examples(self):
-        """get_meta_doc properly indented examples as a list of strings."""
-        full_schema = deepcopy(self.required_schema)
-        full_schema.update(
-            {
-                "examples": [
-                    'ex1:\n    [don\'t, expand, "this"]',
-                    "ex2: true",
-                ],
-                "properties": {
-                    "prop1": {
-                        "type": "array",
-                        "description": "prop-description.",
-                        "items": {"type": "integer"},
-                    }
-                },
-            }
-        )
-        expected = [
-            "   .. tab-item:: Config schema\n\n",
-            "      * **prop1:** (array of integer) prop-description.\n\n",
-            "   .. tab-item:: Examples\n\n",
-            "      ::\n\n\n",
-            "         # --- Example1 ---\n\n",
-            "         prop1:\n",
-            '             [don\'t, expand, "this"]\n',
-            "         # --- Example2 ---\n\n",
-            "         prop2: true",
-        ]
-        assert "".join(expected) in get_meta_doc(self.meta, full_schema)
-
-    def test_get_meta_doc_properly_parse_description(self):
-        """get_meta_doc description properly formatted"""
-        schema = {
-            "properties": {
-                "p1": {
-                    "type": "string",
-                    "description": dedent(
-                        """\
-                        This item
-                        has the
-                        following options:
-
-                          - option1
-                          - option2
-                          - option3
-
-                        The default value is
-                        option1"""
-                    ),
-                }
-            }
-        }
-
-        expected = [
-            "   .. tab-item:: Config schema\n\n",
-            "      * **p1:** (string) This item has the following options:\n\n",  # noqa: E501
-            "        - option1\n",
-            "        - option2\n",
-            "        - option3\n\n",
-            "        The default value is option1",
-        ]
-        assert "".join(expected) in get_meta_doc(self.meta, schema)
-
-    @pytest.mark.parametrize("key", meta.keys())
-    def test_get_meta_doc_raises_key_errors(self, key):
-        """get_meta_doc raises KeyErrors on missing keys."""
-        schema = {
-            "properties": {
-                "prop1": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [{"type": "string"}, {"type": "integer"}]
-                    },
-                }
-            }
-        }
-        invalid_meta = deepcopy(self.meta)
-        invalid_meta.pop(key)
-        with pytest.raises(
-            KeyError,
-            match=f"Missing required keys in module meta: {{'{key}'}}",
-        ):
-            get_meta_doc(invalid_meta, schema)
-
-    @pytest.mark.parametrize(
-        "key,expectation",
-        [
-            ("activate_by_schema_keys", does_not_raise()),
-            (
-                "additional_key",
-                pytest.raises(
-                    KeyError,
-                    match=(
-                        "Additional unexpected keys found in module meta:"
-                        " {'additional_key'}"
-                    ),
-                ),
-            ),
-        ],
-    )
-    def test_get_meta_doc_additional_keys(self, key, expectation):
-        schema = {
-            "properties": {
-                "prop1": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [{"type": "string"}, {"type": "integer"}]
-                    },
-                }
-            }
-        }
-        invalid_meta = deepcopy(self.meta)
-        invalid_meta[key] = []
-        with expectation:
-            get_meta_doc(invalid_meta, schema)
-
-    def test_label_overrides_property_name(self):
-        """get_meta_doc overrides property name with label."""
-        schema = {
-            "properties": {
-                "old_prop1": {
-                    "type": "string",
-                    "label": "label1",
-                },
-                "prop_no_label": {
-                    "type": "string",
-                },
-                "prop_array": {
-                    "label": "array_label",
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "some_prop": {"type": "number"},
-                        },
-                    },
-                },
-            },
-            "patternProperties": {
-                "^.*$": {
-                    "type": "string",
-                    "label": "label2",
-                }
-            },
-        }
-        meta_doc = get_meta_doc(self.meta, schema)
-        assert "**label1:** (string)" in meta_doc
-        assert "**label2:** (string" in meta_doc
-        assert "**prop_no_label:** (string)" in meta_doc
-        assert "Each object in **array_label** list" in meta_doc
-
-        assert "old_prop1" not in meta_doc
-        assert ".*" not in meta_doc
-
-    @pytest.mark.parametrize(
-        "schema,expected_lines",
-        [
-            pytest.param(
-                {
-                    "properties": {
-                        "prop1": {
-                            "type": ["string", "integer"],
-                            "deprecated": True,
-                            "description": "<description>",
-                        }
-                    }
-                },
-                [
-                    "* **prop1:** (string/integer) <description>",
-                    "*Deprecated in version <missing deprecated_version "
-                    "key, please file a bug report>.*",
-                ],
-                id="missing_deprecated_version",
-            ),
-            pytest.param(
-                {
-                    "$schema": "http://json-schema.org/draft-04/schema#",
-                    "properties": {
-                        "prop1": {
-                            "type": ["string", "integer"],
-                            "description": "<description>",
-                            "deprecated": True,
-                            "deprecated_version": "2",
-                            "changed": True,
-                            "changed_version": "1",
-                            "new": True,
-                            "new_version": "1",
-                        },
-                    },
-                },
-                [
-                    "* **prop1:** (string/integer) <description>",
-                    "*Deprecated in version 2.*",
-                    "*Changed in version 1.*",
-                    "*New in version 1.*",
-                ],
-                id="deprecated_no_description",
-            ),
-            pytest.param(
-                {
-                    "$schema": "http://json-schema.org/draft-04/schema#",
-                    "properties": {
-                        "prop1": {
-                            "type": ["string", "integer"],
-                            "description": "<description>",
-                            "deprecated": True,
-                            "deprecated_version": "2",
-                            "deprecated_description": "dep",
-                            "changed": True,
-                            "changed_version": "1",
-                            "changed_description": "chg",
-                            "new": True,
-                            "new_version": "1",
-                            "new_description": "new",
-                        },
-                    },
-                },
-                [
-                    "**prop1:** (string/integer) <description>",
-                    "*Deprecated in version 2. dep*",
-                    "*Changed in version 1. chg*",
-                    "*New in version 1. new*",
-                ],
-                id="deprecated_with_description",
-            ),
-            pytest.param(
-                {
-                    "$schema": "http://json-schema.org/draft-04/schema#",
-                    "$defs": {"my_ref": {"deprecated": True}},
-                    "properties": {
-                        "prop1": {
-                            "allOf": [
-                                {
-                                    "type": ["string", "integer"],
-                                    "description": "<description>",
-                                },
-                                {"$ref": "#/$defs/my_ref"},
-                            ]
-                        }
-                    },
-                },
-                [
-                    "**prop1:** (string/integer) <description>",
-                    "*Deprecated in version <missing deprecated_version "
-                    "key, please file a bug report>.*",
-                ],
-                id="deprecated_ref_missing_version",
-            ),
-            pytest.param(
-                {
-                    "$schema": "http://json-schema.org/draft-04/schema#",
-                    "$defs": {
-                        "my_ref": {
-                            "deprecated": True,
-                            "description": "<description>",
-                        }
-                    },
-                    "properties": {
-                        "prop1": {
-                            "allOf": [
-                                {"type": ["string", "integer"]},
-                                {"$ref": "#/$defs/my_ref"},
-                            ]
-                        }
-                    },
-                },
-                [
-                    "**prop1:** (string/integer) <description>",
-                    "*Deprecated in version <missing deprecated_version "
-                    "key, please file a bug report>.*",
-                ],
-                id="deprecated_ref_missing_version_with_description",
-            ),
-            pytest.param(
-                {
-                    "$schema": "http://json-schema.org/draft-04/schema#",
-                    "properties": {
-                        "prop1": {
-                            "description": "<description>",
-                            "anyOf": [
-                                {
-                                    "type": ["string", "integer"],
-                                    "description": "<deprecated_description>.",
-                                    "deprecated": True,
-                                },
-                            ],
-                        },
-                    },
-                },
-                [
-                    "**prop1:** (UNDEFINED) <description>. "
-                    "<deprecated_description>.",
-                    "*Deprecated in version <missing deprecated_version key, "
-                    "please file a bug report>.*",
-                ],
-                id="deprecated_missing_version_with_description",
-            ),
-            pytest.param(
-                {
-                    "$schema": "http://json-schema.org/draft-04/schema#",
-                    "properties": {
-                        "prop1": {
-                            "anyOf": [
-                                {
-                                    "type": ["string", "integer"],
-                                    "description": "<deprecated_description>.",
-                                    "deprecated": True,
-                                },
-                                {
-                                    "type": "number",
-                                    "description": "<description>",
-                                },
-                            ]
-                        },
-                    },
-                },
-                [
-                    "**prop1:** (number) <deprecated_description>.",
-                    "*Deprecated in version <missing "
-                    "deprecated_version key, please file a bug report>.*",
-                ],
-                id="deprecated_anyof_missing_version_with_description",
-            ),
-            pytest.param(
-                {
-                    "$schema": "http://json-schema.org/draft-04/schema#",
-                    "properties": {
-                        "prop1": {
-                            "anyOf": [
-                                {
-                                    "type": ["string", "integer"],
-                                    "description": "<deprecated_description>",
-                                    "deprecated": True,
-                                    "deprecated_version": "22.1",
-                                },
-                                {
-                                    "type": "string",
-                                    "enum": ["none", "unchanged", "os"],
-                                    "description": "<description>",
-                                },
-                            ]
-                        },
-                    },
-                },
-                [
-                    "**prop1:** (``none``/``unchanged``/``os``) "
-                    "<description>. <deprecated_description>",
-                    "*Deprecated in version 22.1.*",
-                ],
-                id="deprecated_anyof_with_description",
-            ),
-            pytest.param(
-                {
-                    "$schema": "http://json-schema.org/draft-04/schema#",
-                    "properties": {
-                        "prop1": {
-                            "anyOf": [
-                                {
-                                    "type": ["string", "integer"],
-                                    "description": "<description_1>",
-                                },
-                                {
-                                    "type": "string",
-                                    "enum": ["none", "unchanged", "os"],
-                                    "description": "<description>_2",
-                                },
-                            ]
-                        },
-                    },
-                },
-                [
-                    "**prop1:** (string/integer/``none``/"
-                    "``unchanged``/``os``) <description_1>. "
-                    "<description>_2",
-                ],
-                id="anyof_not_deprecated",
-            ),
-            pytest.param(
-                {
-                    "properties": {
-                        "prop1": {
-                            "description": "<desc_1>",
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "anyOf": [
-                                    {
-                                        "properties": {
-                                            "sub_prop1": {"type": "string"},
-                                        },
-                                    },
-                                ],
-                            },
-                        },
-                    },
-                },
-                [
-                    "**prop1:** (array of object) <desc_1>\n",
-                ],
-                id="not_deprecated",
-            ),
-        ],
-    )
-    def test_get_meta_doc_render_deprecated_info(self, schema, expected_lines):
-        doc = get_meta_doc(self.meta, schema)
-        for line in expected_lines:
-            assert line in doc
-
-
 class TestAnnotatedCloudconfigFile:
     def test_annotated_cloudconfig_file_no_schema_errors(self):
         """With no schema_errors, print the original content."""
         content = b"ntp:\n  pools: [ntp1.pools.com]\n"
-        parse_cfg, schemamarks = load_with_marks(content)
+        _, schemamarks = load_with_marks(content)
         assert content == annotated_cloudconfig_file(
-            parse_cfg,
             content,
             schemamarks=schemamarks,
             schema_errors=[],
         )
 
-    def test_annotated_cloudconfig_file_with_non_dict_cloud_config(self):
-        """Error when empty non-dict cloud-config is provided.
-
-        OurJSON validation when user-data is None type generates a bunch
-        schema validation errors of the format:
-        ('', "None is not of type 'object'"). Ignore those symptoms and
-        report the general problem instead.
-        """
-        content = "\n\n\n"
-        expected = "\n".join(
-            [
-                content,
-                "# Errors: -------------",
-                "# E1: Cloud-config is not a YAML dict.\n\n",
-            ]
-        )
-        assert expected == annotated_cloudconfig_file(
-            None,
-            content,
-            schemamarks={},
-            schema_errors=[SchemaProblem("", "None is not of type 'object'")],
-        )
-
     def test_annotated_cloudconfig_file_schema_annotates_and_adds_footer(self):
         """With schema_errors, error lines are annotated and a footer added."""
-        content = dedent(
-            """\
+        content = dedent("""\
             #cloud-config
             # comment
             ntp:
               pools: [-99, 75]
-            """
-        )
-        expected = dedent(
-            """\
+            """)
+        expected = dedent("""\
             #cloud-config
             # comment
             ntp:		# E1
@@ -1715,16 +1074,14 @@ class TestAnnotatedCloudconfigFile:
             # E2: -99 is not a string
             # E3: 75 is not a string
 
-            """
-        )
-        parsed_config, schemamarks = load_with_marks(content[13:])
+            """)
+        _, schemamarks = load_with_marks(content[13:])
         schema_errors = [
             SchemaProblem("ntp", "Some type error"),
             SchemaProblem("ntp.pools.0", "-99 is not a string"),
             SchemaProblem("ntp.pools.1", "75 is not a string"),
         ]
         assert expected == annotated_cloudconfig_file(
-            parsed_config,
             content,
             schemamarks=schemamarks,
             schema_errors=schema_errors,
@@ -1732,31 +1089,26 @@ class TestAnnotatedCloudconfigFile:
 
     def test_annotated_cloudconfig_file_annotates_separate_line_items(self):
         """Errors are annotated for lists with items on separate lines."""
-        content = dedent(
-            """\
+        content = dedent("""\
             #cloud-config
             # comment
             ntp:
               pools:
                 - -99
                 - 75
-            """
-        )
-        expected = dedent(
-            """\
+            """)
+        expected = dedent("""\
             ntp:
               pools:
                 - -99		# E1
                 - 75		# E2
-            """
-        )
-        parsed_config, schemamarks = load_with_marks(content[13:])
+            """)
+        _, schemamarks = load_with_marks(content[13:])
         schema_errors = [
             SchemaProblem("ntp.pools.0", "-99 is not a string"),
             SchemaProblem("ntp.pools.1", "75 is not a string"),
         ]
         assert expected in annotated_cloudconfig_file(
-            parsed_config,
             content,
             schemamarks=schemamarks,
             schema_errors=schema_errors,
@@ -1764,15 +1116,13 @@ class TestAnnotatedCloudconfigFile:
 
     @skipUnlessJsonSchema()
     def test_annotated_invalid_top_level_key(self, tmp_path: Path, capsys):
-        expected_err = dedent(
-            """\
+        expected_err = dedent("""\
             #cloud-config
             invalid_key: value		# E1
 
             # Errors: -------------
             # E1: Additional properties are not allowed ('invalid_key' was unexpected)
-            """  # noqa: E501
-        )
+            """)  # noqa: E501
         config_file = tmp_path / "my.yaml"
         config_file.write_text("#cloud-config\ninvalid_key: value\n")
         with pytest.raises(
@@ -1789,7 +1139,7 @@ class TestAnnotatedCloudconfigFile:
 @mock.patch(M_PATH + "read_cfg_paths")  # called by parse_args help docs
 class TestMain:
     exclusive_combinations = itertools.combinations(
-        ["--system", "--docs all", "--config-file something"], 2
+        ["--system", "--config-file something"], 2
     )
 
     @pytest.mark.parametrize("params", exclusive_combinations)
@@ -1803,23 +1153,22 @@ class TestMain:
 
         _out, err = capsys.readouterr()
         expected = (
-            "Error:\n"
-            "Expected one of --config-file, --system or --docs arguments\n"
+            "Error:\nExpected one of --config-file or --system arguments\n"
         )
         assert expected == err
 
     @pytest.mark.parametrize(
         "params,expectation",
         [
-            pytest.param(["--docs all"], does_not_raise()),
             pytest.param(["--system"], pytest.raises(SystemExit)),
         ],
     )
     @mock.patch(M_PATH + "os.getuid", return_value=100)
     def test_main_ignores_schema_type(
-        self, _read_cfg_paths, _os_getuid, params, expectation, capsys
+        self, _os_getuid, read_cfg_paths, params, expectation, paths, capsys
     ):
-        """Main ignores --schema-type param when --system or --docs present."""
+        """Main ignores --schema-type param when --system present."""
+        read_cfg_paths.return_value = paths
         params = list(itertools.chain(*[a.split() for a in params]))
         with mock.patch(
             "sys.argv", ["mycmd", "--schema-type", "network-config"] + params
@@ -1828,8 +1177,8 @@ class TestMain:
                 main()
         out, _err = capsys.readouterr()
         expected = (
-            "WARNING: The --schema-type parameter is inapplicable when"
-            " either --system or --docs present"
+            "WARNING: The --schema-type parameter is inapplicable when "
+            "--system is present"
         )
         assert expected in out
 
@@ -1842,8 +1191,7 @@ class TestMain:
 
         _out, err = capsys.readouterr()
         expected = (
-            "Error:\n"
-            "Expected one of --config-file, --system or --docs arguments\n"
+            "Error:\nExpected one of --config-file or --system arguments\n"
         )
         assert expected == err
 
@@ -1856,28 +1204,6 @@ class TestMain:
         assert 1 == context_manager.value.code
         _out, err = capsys.readouterr()
         assert "Error: Config file NOT_A_FILE does not exist\n" == err
-
-    def test_main_invalid_flag_combo(self, _read_cfg_paths, capsys):
-        """Main exits non-zero when invalid flag combo used."""
-        myargs = ["mycmd", "--annotate", "--docs", "DOES_NOT_MATTER"]
-        with mock.patch("sys.argv", myargs):
-            with pytest.raises(SystemExit) as context_manager:
-                main()
-        assert 1 == context_manager.value.code
-        _, err = capsys.readouterr()
-        assert (
-            "Error:\nInvalid flag combination. "
-            "Cannot use --annotate with --docs\n" == err
-        )
-
-    def test_main_prints_docs(self, _read_cfg_paths, capsys):
-        """When --docs parameter is provided, main generates documentation."""
-        myargs = ["mycmd", "--docs", "all"]
-        with mock.patch("sys.argv", myargs):
-            assert 0 == main(), "Expected 0 exit code"
-        out, _err = capsys.readouterr()
-        assert "\nNTP\n---\n" in out
-        assert "\nRuncmd\n------\n" in out
 
     @pytest.mark.parametrize(
         "schema_type,content,expected",
@@ -1900,19 +1226,88 @@ class TestMain:
                 ),
                 "Valid schema",
             ),
+            (
+                "network-config",
+                (
+                    b"network:\n version: 1\n config:\n  - type: physical\n"
+                    b"    name: eth0\n    subnets:\n      - type: manual\n"
+                ),
+                "Valid schema",
+            ),
+            (
+                "network-config",
+                (
+                    b"network:\n version: 1\n config:\n  - type: physical\n"
+                    b"    name: eth0\n    subnets:\n      - type: static\n"
+                ),
+                "Valid schema",
+            ),
+            (
+                "network-config",
+                (
+                    b"network:\n version: 1\n config:\n  - type: physical\n"
+                    b"    name: eth0\n    subnets:\n      - type: static6\n"
+                ),
+                "Valid schema",
+            ),
+            (
+                "network-config",
+                (
+                    b"network:\n version: 1\n config:\n  - type: physical\n"
+                    b"    name: eth0\n    subnets:\n      - type: dhcp6\n"
+                ),
+                "Valid schema",
+            ),
+            (
+                "network-config",
+                (
+                    b"network:\n version: 1\n config:\n  - type: physical\n"
+                    b"    name: eth0\n    subnets:\n      - type: dhcp4\n"
+                ),
+                "Valid schema",
+            ),
+            (
+                "network-config",
+                (
+                    b"network:\n version: 1\n config:\n  - type: physical\n"
+                    b"    name: eth0\n    subnets:\n      - type: ipv6_slaac\n"
+                ),
+                "Valid schema",
+            ),
+            (
+                "network-config",
+                (
+                    b"network:\n version: 1\n config:\n  - type: physical\n"
+                    b"    name: eth0\n    subnets:\n"
+                    b"      - type: ipv6_dhcpv6-stateful\n"
+                ),
+                "Valid schema",
+            ),
+            (
+                "network-config",
+                (
+                    b"network:\n version: 1\n config:\n  - type: physical\n"
+                    b"    name: eth0\n    subnets:\n"
+                    b"      - type: ipv6_dhcpv6-stateless\n"
+                ),
+                "Valid schema",
+            ),
         ),
     )
+    @mock.patch("cloudinit.net.netplan.available", return_value=False)
     def test_main_validates_config_file(
         self,
+        _netplan_available,
         _read_cfg_paths,
         schema_type,
         content,
         expected,
         tmpdir,
         capsys,
-        caplog,
+        mocker,
     ):
         """When --config-file parameter is provided, main validates schema."""
+        mocker.patch(f"{M_PATH}LIBNETPLAN_AVAILABLE", False)
         myyaml = tmpdir.join("my.yaml")
         myargs = ["mycmd", "--config-file", myyaml.strpath]
         if schema_type:
@@ -1978,7 +1373,6 @@ class TestMain:
         paths,
         capsys,
     ):
-        """"""
         paths.get_ipath = paths.get_ipath_cur
         read_cfg_paths.return_value = paths
         path_content_by_key = {
@@ -2008,8 +1402,7 @@ class TestMain:
                 " Nothing to validate."
             )
 
-        expected = dedent(
-            f"""\
+        expected = dedent(f"""\
         Found cloud-config data types: {data_types}
 
         1. user-data at {expected_paths["ud_key"]}:
@@ -2023,8 +1416,7 @@ class TestMain:
 
         4. network-config at {expected_paths['net_key']}:
           Valid schema network-config
-        """
-        )
+        """)
         myargs = ["mycmd", "--system"]
         with mock.patch("sys.argv", myargs):
             main()
@@ -2046,7 +1438,7 @@ class TestMain:
                 "   dhcp4: true\n",
                 "  Valid schema network-config",
                 does_not_raise(),
-                id="netv2_schema_validated",
+                id="netv2_schema_validated_non_netplan",
             ),
             pytest.param(
                 "network: {}\n",
@@ -2073,10 +1465,12 @@ class TestMain:
     )
     @mock.patch(M_PATH + "read_cfg_paths")
     @mock.patch(M_PATH + "os.getuid", return_value=0)
+    @mock.patch("cloudinit.net.netplan.available", return_value=False)
     def test_main_validates_system_userdata_vendordata_and_network_config(
         self,
-        _read_cfg_paths,
+        _netplan_available,
         _getuid,
+        _read_cfg_paths,
         read_cfg_paths,
         net_config,
         net_output,
@@ -2086,6 +1480,7 @@ class TestMain:
         paths,
     ):
         """When --system is provided, main validates all config userdata."""
+        mocker.patch(f"{M_PATH}LIBNETPLAN_AVAILABLE", False)
         paths.get_ipath = paths.get_ipath_cur
         read_cfg_paths.return_value = paths
         cloud_config_file = paths.get_ipath_cur("cloud_config")
@@ -2108,8 +1503,7 @@ class TestMain:
 
         net_output = net_output.format(network_file=network_file)
         data_types = "user-data, vendor-data, vendor2-data, network-config"
-        expected = dedent(
-            f"""\
+        expected = dedent(f"""\
         Found cloud-config data types: {data_types}
 
         1. user-data at {cloud_config_file}:
@@ -2123,8 +1517,7 @@ class TestMain:
 
         4. network-config at {network_file}:
         {net_output}
-        """
-        )
+        """)
         assert expected == out
 
     @mock.patch(M_PATH + "os.getuid", return_value=1000)
@@ -2169,6 +1562,13 @@ class TestSchemaDocExamples:
     @skipUnlessJsonSchema()
     def test_cloud_config_schema_doc_examples(self, example_path):
         validate_cloudconfig_file(example_path, self.schema)
+
+        # Assert no use of deprecated keys
+        validate_cloudconfig_schema(
+            config=yaml.safe_load(open(example_path)),
+            schema=self.schema,
+            strict=True,
+        )
 
     @pytest.mark.parametrize(
         "example_path",
@@ -2282,6 +1682,16 @@ class TestNetworkSchema:
             ),
             pytest.param(
                 {
+                    "version": 2,
+                    "ethernets": {"eno1": {"dhcp4": True}},
+                },
+                SchemaType.NETWORK_CONFIG_V2,
+                does_not_raise(),
+                "",
+                id="net_v2_no_top_level",
+            ),
+            pytest.param(
+                {
                     "network": {
                         "version": 2,
                         "ethernets": {
@@ -2357,7 +1767,7 @@ class TestNetworkSchema:
                 SchemaType.NETWORK_CONFIG_V1,
                 does_not_raise(),
                 "",
-                id="config_key_required",
+                id="config_key_empty_valid",
             ),
             pytest.param(
                 {
@@ -2455,11 +1865,41 @@ class TestNetworkSchema:
                 "",
                 id="GH-4710_mtu_none_and_str_address",
             ),
+            pytest.param(
+                {
+                    "network": {
+                        "version": 1,
+                        "config": [
+                            {
+                                "type": "physical",
+                                "name": "eth0",
+                                "subnets": [
+                                    {"type": "dhcp4", "metric": 100},
+                                    {"type": "dhcp6", "metric": 1000},
+                                ],
+                            }
+                        ],
+                    }
+                },
+                SchemaType.NETWORK_CONFIG_V1,
+                does_not_raise(),
+                "",
+                id="subnet_metric_validation",
+            ),
         ),
     )
+    @mock.patch("cloudinit.net.netplan.available", return_value=False)
     def test_network_schema(
-        self, src_config, schema_type_version, expectation, log, caplog
+        self,
+        _netplan_available,
+        src_config,
+        schema_type_version,
+        expectation,
+        log,
+        caplog,
+        mocker,
     ):
+        mocker.patch(f"{M_PATH}LIBNETPLAN_AVAILABLE", False)
         net_schema = get_schema(schema_type=schema_type_version)
         with expectation:
             validate_cloudconfig_schema(
@@ -2480,7 +1920,7 @@ class TestStrictMetaschema:
     @skipUnlessJsonSchema()
     def test_modules(self):
         """Validate all modules with a stricter metaschema"""
-        (validator, _) = get_jsonschema_validator()
+        validator, _ = get_jsonschema_validator()
         for name, value in get_schemas().items():
             if value:
                 validate_cloudconfig_metaschema(validator, value)
@@ -2494,7 +1934,7 @@ class TestStrictMetaschema:
         item should be 'items' and is therefore interpreted as an additional
         property which is invalid with a strict metaschema
         """
-        (validator, _) = get_jsonschema_validator()
+        validator, _ = get_jsonschema_validator()
         schema = {
             "type": "array",
             "item": {
@@ -2521,63 +1961,6 @@ class TestMeta:
             assert "distros" in module.meta
             assert {module.meta["frequency"]}.issubset(FREQUENCIES)
             assert set(module.meta["distros"]).issubset(all_distros)
-
-
-def remove_modules(schema, modules: Set[str]) -> dict:
-    indices_to_delete = set()
-    for module in set(modules):
-        for index, ref_dict in enumerate(schema["allOf"]):
-            if ref_dict["$ref"] == f"#/$defs/{module}":
-                indices_to_delete.add(index)
-                continue  # module found
-    for index in indices_to_delete:
-        schema["allOf"].pop(index)
-    return schema
-
-
-def remove_defs(schema, defs: Set[str]) -> dict:
-    defs_to_delete = set(schema["$defs"].keys()).intersection(set(defs))
-    for key in defs_to_delete:
-        del schema["$defs"][key]
-    return schema
-
-
-def clean_schema(
-    schema=None,
-    modules: Optional[Sequence[str]] = None,
-    defs: Optional[Sequence[str]] = None,
-):
-    schema = deepcopy(schema or get_schema())
-    if modules:
-        remove_modules(schema, set(modules))
-    if defs:
-        remove_defs(schema, set(defs))
-    del schema["properties"]
-    del schema["additionalProperties"]
-    return schema
-
-
-@pytest.mark.hypothesis_slow
-class TestSchemaFuzz:
-    # Avoid https://github.com/Zac-HD/hypothesis-jsonschema/issues/97
-    SCHEMA = clean_schema(
-        modules=["cc_users_groups"],
-        defs=["users_groups.groups_by_groupname", "users_groups.user"],
-    )
-
-    @skipUnlessHypothesisJsonSchema()
-    @given(from_schema(SCHEMA))
-    def test_validate_full_schema(self, orig_config):
-        config = deepcopy(orig_config)
-        valid_props = get_schema()["properties"].keys()
-        for key in orig_config.keys():
-            if key not in valid_props:
-                del config[key]
-        try:
-            validate_cloudconfig_schema(config, strict=True)
-        except SchemaValidationError as ex:
-            if ex.has_errors():
-                raise
 
 
 class TestHandleSchemaArgs:
@@ -2614,14 +1997,10 @@ class TestHandleSchemaArgs:
         read_cfg_paths.side_effect = [failure, paths]
         user_data_fn = tmpdir.join("user-data")
         with open(user_data_fn, "w") as f:
-            f.write(
-                dedent(
-                    """\
+            f.write(dedent("""\
                     #cloud-config
                     packages: [sl]
-                    """
-                )
-            )
+                    """))
         args = self.Args(
             config_file=str(user_data_fn),
             schema_type="cloud-config",
@@ -2636,12 +2015,12 @@ class TestHandleSchemaArgs:
             assert expected_log in caplog.text
 
     @pytest.mark.parametrize(
-        "annotate, expected_output",
+        "annotate, deprecation_info_boundary, expected_output",
         [
-            (
+            pytest.param(
                 True,
-                dedent(
-                    """\
+                "devel",
+                dedent("""\
                     #cloud-config
                     packages:
                     - htop
@@ -2650,27 +2029,46 @@ class TestHandleSchemaArgs:
                     apt_reboot_if_required: true            # D3
 
                     # Deprecations: -------------
-                    # D1: Default: ``false``. Deprecated in version 22.2. Use ``package_update`` instead.
-                    # D2: Default: ``false``. Deprecated in version 22.2. Use ``package_upgrade`` instead.
-                    # D3: Default: ``false``. Deprecated in version 22.2. Use ``package_reboot_if_required`` instead.
+                    # D1: Deprecated in version 22.2. Use **package_update** instead.
+                    # D2: Deprecated in version 22.2. Use **package_upgrade** instead.
+                    # D3: Deprecated in version 22.2. Use **package_reboot_if_required** instead.
 
                     Valid schema {cfg_file}
-                    """  # noqa: E501
-                ),
+                    """),  # noqa: E501
+                id="test_annotated_deprecation_info_boundary_devel_shows",
             ),
-            (
-                False,
-                dedent(
-                    """\
-                    Cloud config schema deprecations: \
-apt_reboot_if_required: Default: ``false``. Deprecated in version 22.2.\
- Use ``package_reboot_if_required`` instead., apt_update: Default: \
-``false``. Deprecated in version 22.2. Use ``package_update`` instead.,\
- apt_upgrade: Default: ``false``. Deprecated in version 22.2. Use \
-``package_upgrade`` instead.\
+            pytest.param(
+                True,
+                "22.1",
+                dedent("""\
+                    #cloud-config
+                    packages:
+                    - htop
+                    apt_update: true                # D1
+                    apt_upgrade: true               # D2
+                    apt_reboot_if_required: true            # D3
+
+                    # Deprecations: -------------
+                    # D1: Deprecated in version 22.2. Use **package_update** instead.
+                    # D2: Deprecated in version 22.2. Use **package_upgrade** instead.
+                    # D3: Deprecated in version 22.2. Use **package_reboot_if_required** instead.
+
                     Valid schema {cfg_file}
-                    """  # noqa: E501
-                ),
+                    """),  # noqa: E501
+                id="test_annotated_deprecation_info_boundary_below_unredacted",
+            ),
+            pytest.param(
+                False,
+                "18.2",
+                dedent("""\
+                    Cloud config schema deprecations: \
+apt_reboot_if_required: Deprecated in version 22.2. Use\
+ **package_reboot_if_required** instead., apt_update: Deprecated in version\
+ 22.2. Use **package_update** instead., apt_upgrade: Deprecated in version\
+ 22.2. Use **package_upgrade** instead.\
+                    Valid schema {cfg_file}
+                    """),  # noqa: E501
+                id="test_deprecation_info_boundary_does_unannotated_unredacted",
             ),
         ],
     )
@@ -2679,28 +2077,29 @@ apt_reboot_if_required: Default: ``false``. Deprecated in version 22.2.\
         self,
         read_cfg_paths,
         annotate,
+        deprecation_info_boundary,
         expected_output,
         paths,
         caplog,
         capsys,
         tmpdir,
+        mocker,
     ):
         paths.get_ipath = paths.get_ipath_cur
         read_cfg_paths.return_value = paths
         user_data_fn = tmpdir.join("user-data")
         with open(user_data_fn, "w") as f:
-            f.write(
-                dedent(
-                    """\
+            f.write(dedent("""\
                     #cloud-config
                     packages:
                     - htop
                     apt_update: true
                     apt_upgrade: true
                     apt_reboot_if_required: true
-                    """
-                )
-            )
+                    """))
+        mocker.patch.object(
+            features, "DEPRECATION_INFO_BOUNDARY", deprecation_info_boundary
+        )
         args = self.Args(
             config_file=str(user_data_fn),
             schema_type="cloud-config",
@@ -2724,8 +2123,7 @@ apt_reboot_if_required: Default: ``false``. Deprecated in version 22.2.\
             pytest.param(
                 0,
                 True,
-                dedent(
-                    """\
+                dedent("""\
                     #cloud-config
                     hostname: 123		# E1
 
@@ -2733,8 +2131,7 @@ apt_reboot_if_required: Default: ``false``. Deprecated in version 22.2.\
                     # E1: 123 is not of type 'string'
 
 
-                    """  # noqa: E501
-                ),
+                    """),  # noqa: E501
                 """Error: Invalid schema: user-data\n\n""",
                 pytest.raises(SystemExit),
                 id="root_annotate_errors_with_exception",
@@ -2742,19 +2139,15 @@ apt_reboot_if_required: Default: ``false``. Deprecated in version 22.2.\
             pytest.param(
                 0,
                 False,
-                dedent(
-                    """\
+                dedent("""\
                     Invalid user-data {cfg_file}
-                    """  # noqa: E501
-                ),
-                dedent(
-                    """\
+                    """),  # noqa: E501
+                dedent("""\
                     Error: Cloud config schema errors: hostname: 123 is not of type 'string'
 
                     Error: Invalid schema: user-data
 
-                    """  # noqa: E501
-                ),
+                    """),  # noqa: E501
                 pytest.raises(SystemExit),
                 id="root_no_annotate_exception_with_unique_errors",
             ),
@@ -2787,15 +2180,11 @@ apt_reboot_if_required: Default: ``false``. Deprecated in version 22.2.\
         with open(id_path, "w") as f:
             f.write(json.dumps({"ds": {"asdf": 123}}))
         with open(user_data_fn, "w") as f:
-            f.write(
-                dedent(
-                    """\
+            f.write(dedent("""\
                     ## template: jinja
                     #cloud-config
                     hostname: {{ ds.asdf }}
-                    """
-                )
-            )
+                    """))
         args = self.Args(
             config_file=str(user_data_fn),
             schema_type="cloud-config",
@@ -2824,20 +2213,16 @@ apt_reboot_if_required: Default: ``false``. Deprecated in version 22.2.\
             pytest.param(
                 0,
                 False,
-                dedent(
-                    """\
+                dedent("""\
                     Invalid user-data {cfg_file}
-                    """  # noqa: E501
-                ),
-                dedent(
-                    """\
+                    """),  # noqa: E501
+                dedent("""\
                     Error: Cloud config schema errors: format-l1.c1: Unrecognized user-data header in {cfg_file}: "#bogus-config".
                     Expected first line to be one of: #!, ## template: jinja, #cloud-boothook, #cloud-config, #cloud-config-archive, #cloud-config-jsonp, #include, #include-once, #part-handler
 
                     Error: Invalid schema: user-data
 
-                    """  # noqa: E501
-                ),
+                    """),  # noqa: E501
                 pytest.raises(SystemExit),
                 id="root_no_annotate_exception_with_unique_errors",
             ),
@@ -2868,14 +2253,10 @@ apt_reboot_if_required: Default: ``false``. Deprecated in version 22.2.\
         else:
             id_path = paths.get_runpath("instance_data")
         with open(user_data_fn, "w") as f:
-            f.write(
-                dedent(
-                    """\
+            f.write(dedent("""\
                     #bogus-config
                     hostname: notgonnamakeit
-                    """
-                )
-            )
+                    """))
         args = self.Args(
             config_file=str(user_data_fn),
             schema_type=None,
@@ -2897,3 +2278,14 @@ apt_reboot_if_required: Default: ``false``. Deprecated in version 22.2.\
         assert read_cfg_paths.call_args_list == [
             mock.call(fetch_existing_datasource="trust")
         ]
+
+
+class TestDeprecation:
+    def test_get_meta_doc_deprecation(self, caplog):
+        """Test that calling get_meta_doc() emits deprecation.
+
+        Ensures that custom modules calling `get_meta_doc()` can still
+        function but receive deprecation warning.
+        """
+        get_meta_doc("some", "random", "arguments", plus="kwargs")
+        assert "The 'get_meta_doc()' function is deprecated" in caplog.text

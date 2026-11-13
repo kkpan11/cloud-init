@@ -14,7 +14,6 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
-import requests
 import responses
 
 from cloudinit import handlers
@@ -24,7 +23,6 @@ from cloudinit import user_data as ud
 from cloudinit import util
 from cloudinit.config.modules import Modules
 from cloudinit.settings import DEFAULT_RUN_DIR, PER_INSTANCE
-from tests.unittests import helpers
 from tests.unittests.util import FakeDataSource
 
 MPATH = "cloudinit.stages"
@@ -137,7 +135,7 @@ class TestConsumeUserData:
             freq=PER_INSTANCE,
         )
         mods = Modules(initer)
-        (_which_ran, _failures) = mods.run_section("cloud_init_modules")
+        _which_ran, _failures = mods.run_section("cloud_init_modules")
         cfg = mods.cfg
         assert "vendor_data" in cfg
         assert "vendor_data2" in cfg
@@ -183,7 +181,7 @@ class TestConsumeUserData:
             freq=PER_INSTANCE,
         )
         mods = Modules(initer)
-        (_which_ran, _failures) = mods.run_section("cloud_init_modules")
+        _which_ran, _failures = mods.run_section("cloud_init_modules")
         cfg = mods.cfg
         assert cfg["baz"] == "qux"
         assert cfg["bar"] == "qux2"
@@ -294,7 +292,7 @@ run:
             freq=PER_INSTANCE,
         )
         mods = Modules(initer)
-        (_which_ran, _failures) = mods.run_section("cloud_init_modules")
+        _which_ran, _failures = mods.run_section("cloud_init_modules")
         cfg = mods.cfg
         assert "vendor_data" in cfg
         assert cfg["a"] == "c"
@@ -336,7 +334,7 @@ vendor_data:
             freq=PER_INSTANCE,
         )
         mods = Modules(initer)
-        (_which_ran, _failures) = mods.run_section("cloud_init_modules")
+        _which_ran, _failures = mods.run_section("cloud_init_modules")
         vendor_script = initer.paths.get_ipath_cur("vendor_scripts")
         vendor_script_fns = "%s/part-001" % vendor_script
         assert os.path.exists(vendor_script_fns) is True
@@ -362,9 +360,9 @@ run:
  - morestuff
 """
         message2 = MIMEBase("text", "cloud-config")
-        message2[
-            "X-Merge-Type"
-        ] = "dict(recurse_array,recurse_str)+list(append)+str(append)"
+        message2["X-Merge-Type"] = (
+            "dict(recurse_array,recurse_str)+list(append)+str(append)"
+        )
         message2.set_payload(blob2)
 
         blob3 = """
@@ -473,19 +471,7 @@ c: 4
             init_tmp.paths.get_ipath("cloud_config"), "", 0o600
         )
 
-    # Since features are intended to be overridden downstream, mock them
-    # all here so new feature flags don't require a new change to this
-    # unit test.
-    @mock.patch.multiple(
-        "cloudinit.features",
-        ERROR_ON_USER_DATA_FAILURE=True,
-        ALLOW_EC2_MIRRORS_ON_NON_AWS_INSTANCE_TYPES=True,
-        EXPIRE_APPLIES_TO_HASHED_USERS=False,
-        NETPLAN_CONFIG_ROOT_READ_ONLY=True,
-        NOCLOUD_SEED_URL_APPEND_FORWARD_SLASH=False,
-        APT_DEB822_SOURCE_LIST_FILE=True,
-    )
-    def test_shellscript(self, init_tmp, tmpdir, caplog):
+    def test_shellscript(self, init_tmp, caplog):
         """Raw text starting #!/bin/sh is treated as script."""
         script = "#!/bin/sh\necho hello\n"
         init_tmp.datasource = FakeDataSource(script)
@@ -507,14 +493,32 @@ c: 4
                 mock.call(init_tmp.paths.get_ipath("cloud_config"), "", 0o600),
             ]
         )
+
+    def test_expected_artifacts(self, init_tmp, tmpdir, caplog, mocker):
+        """Test combined_cloud_config and instance_data_sensitive contents."""
+        init_tmp.datasource = FakeDataSource()
+
+        mocker.patch("cloudinit.util.write_file")
+        mocker.patch.object(init_tmp, "_reset")
+        mocker.patch(
+            "cloudinit.features.get_features",
+            return_value={
+                "ERROR_ON_USER_DATA_FAILURE": True,
+                "ALLOW_EC2_MIRRORS_ON_NON_AWS_INSTANCE_TYPES": False,
+                "SOME_FAKE_FEATURE": True,
+            },
+        )
+
+        with caplog.at_level(logging.WARNING):
+            init_tmp.fetch()
+            init_tmp.consume_data()
+            assert caplog.records == []  # No warnings
+
         expected = {
             "features": {
                 "ERROR_ON_USER_DATA_FAILURE": True,
-                "ALLOW_EC2_MIRRORS_ON_NON_AWS_INSTANCE_TYPES": True,
-                "EXPIRE_APPLIES_TO_HASHED_USERS": False,
-                "NETPLAN_CONFIG_ROOT_READ_ONLY": True,
-                "NOCLOUD_SEED_URL_APPEND_FORWARD_SLASH": False,
-                "APT_DEB822_SOURCE_LIST_FILE": True,
+                "ALLOW_EC2_MIRRORS_ON_NON_AWS_INSTANCE_TYPES": False,
+                "SOME_FAKE_FEATURE": True,
             },
             "system_info": {
                 "default_user": {"name": "ubuntu"},
@@ -673,7 +677,7 @@ c: 4
             freq=PER_INSTANCE,
         )
         mods = Modules(init)
-        (_which_ran, _failures) = mods.run_section("cloud_init_modules")
+        _which_ran, _failures = mods.run_section("cloud_init_modules")
         cfg = mods.cfg
         assert "vendor_data" in cfg
         assert cfg["baz"] == "quxA"
@@ -740,9 +744,7 @@ class TestConsumeUserDataHttp:
         responses.add(
             responses.GET,
             bad_url,
-            body=requests.HTTPError(
-                f"403 Client Error: Forbidden for url: {bad_url}"
-            ),
+            body="forbidden",
             status=403,
         )
 
@@ -770,51 +772,80 @@ class TestConsumeUserDataHttp:
         assert cc.get("included") is True
 
 
-class TestUDProcess(helpers.ResourceUsingTestCase):
-    def test_bytes_in_userdata(self):
+class TestUDProcess:
+    def test_bytes_in_userdata(self, ud_proc):
         msg = b"#cloud-config\napt_update: True\n"
-        ud_proc = ud.UserDataProcessor(self.getCloudPaths())
         message = ud_proc.process(msg)
-        self.assertTrue(count_messages(message) == 1)
+        assert count_messages(message) == 1
 
-    def test_string_in_userdata(self):
+    def test_string_in_userdata(self, ud_proc):
         msg = "#cloud-config\napt_update: True\n"
-
-        ud_proc = ud.UserDataProcessor(self.getCloudPaths())
         message = ud_proc.process(msg)
-        self.assertTrue(count_messages(message) == 1)
+        assert count_messages(message) == 1
 
-    def test_compressed_in_userdata(self):
+    def test_compressed_in_userdata(self, ud_proc):
         msg = gzip_text("#cloud-config\napt_update: True\n")
-
-        ud_proc = ud.UserDataProcessor(self.getCloudPaths())
         message = ud_proc.process(msg)
-        self.assertTrue(count_messages(message) == 1)
+        assert count_messages(message) == 1
+
+    @pytest.mark.parametrize("compress", [False, True])
+    @pytest.mark.parametrize("transfer_encoding", [None, "7bit", "8bit"])
+    def test_mime_part_with_unencoded_utf8_text(
+        self, transfer_encoding, compress, ud_proc
+    ):
+        """Non-ASCII text in parts without base64 encoding is preserved."""
+        cloud_config = "#cloud-config\nusers:\n  - gecos: José Müller 你好\n"
+        cte_header = (
+            f"Content-Transfer-Encoding: {transfer_encoding}\n"
+            if transfer_encoding
+            else ""
+        )
+        blob = (
+            'Content-Type: multipart/mixed; boundary="BOUNDARY"\n'
+            "MIME-Version: 1.0\n\n"
+            "--BOUNDARY\n"
+            "Content-Type: text/cloud-config\n"
+            f"{cte_header}\n"
+            f"{cloud_config}\n"
+            "--BOUNDARY--\n"
+        )
+        message = ud_proc.process(gzip_text(blob) if compress else blob)
+        payloads = [
+            util.fully_decoded_payload(part)
+            for part in message.walk()
+            if not ud.is_skippable(part)
+        ]
+        assert payloads == [cloud_config]
+        assert util.load_yaml(payloads[0]) == {
+            "users": [{"gecos": "José Müller 你好"}]
+        }
+        # The processed message is written to user-data.txt.i as str
+        assert "gecos: José Müller 你好\n" in str(message)
 
 
-class TestConvertString(helpers.TestCase):
+class TestConvertString:
     def test_handles_binary_non_utf8_decodable(self):
         """Printable unicode (not utf8-decodable) is safely converted."""
         blob = b"#!/bin/bash\necho \xc3\x84\n"
         msg = ud.convert_string(blob)
-        self.assertEqual(blob, msg.get_payload(decode=True))
+        assert blob == msg.get_payload(decode=True)
 
     def test_handles_binary_utf8_decodable(self):
         blob = b"\x32\x32"
         msg = ud.convert_string(blob)
-        self.assertEqual(blob, msg.get_payload(decode=True))
+        assert blob == msg.get_payload(decode=True)
 
     def test_handle_headers(self):
         text = "hi mom"
         msg = ud.convert_string(text)
-        self.assertEqual(text, msg.get_payload(decode=False))
+        assert text == msg.get_payload(decode=False)
 
     def test_handle_mime_parts(self):
         """Mime parts are properly returned as a mime message."""
         message = MIMEBase("text", "plain")
         message.set_payload("Just text")
         msg = ud.convert_string(str(message))
-        self.assertEqual("Just text", msg.get_payload(decode=False))
+        assert "Just text" == msg.get_payload(decode=False)
 
 
 class TestFetchBaseConfig:

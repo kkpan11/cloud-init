@@ -14,7 +14,7 @@ Requirements
 ==============
 
 1. **WSL interoperability must be enabled**. The datasource needs to execute
-   some Windows binaries to compute the possible locations of the user data
+   some Windows binaries to compute the possible locations of the user-data
    files.
 
 2. **WSL automount must be enabled**. The datasource needs to access files in
@@ -39,21 +39,44 @@ For more information about how to configure WSL,
 
 .. _wsl_user_data_configuration:
 
-User data configuration
+User-data configuration
 ========================
 
 The WSL datasource relies exclusively on the Windows filesystem as the provider
-of user data. Access to those files is provided by WSL itself unless disabled
+of user-data. Access to those files is provided by WSL itself unless disabled
 by the user, thus the datasource doesn't require any special component running
 on the Windows host to provide such data.
 
-User data can be supplied in any
+User-data can be supplied in any
 :ref:`format supported by cloud-init<user_data_formats>`, such as YAML
 cloud-config files or shell scripts. At runtime, the WSL datasource looks for
-user data in the following locations inside the Windows host filesystem, in the
-order specified below:
+user-data in the following locations inside the Windows host filesystem, in the
+order specified below.
+The WSL datasource will be enabled if cloud-init discovers at least one of the
+applicable config files described below.
 
-1. ``%USERPROFILE%\.cloud-init\<InstanceName>.user-data`` holds user data for a
+First, configurations from Ubuntu Pro/Landscape are checked for in the
+following paths:
+
+1. ``%USERPROFILE%\.ubuntupro\.cloud-init\<InstanceName>.user-data`` holds data
+   provided by Landscape to configure a specific WSL instance. If this file
+   is present, normal user-provided configurations are not looked for. This
+   file is merged with (2) on a per-module basis. If this file is not present,
+   then the first user-provided configuration will be used in its place.
+
+2. ``%USERPROFILE%\.ubuntupro\.cloud-init\agent.yaml`` holds data provided by
+   the Ubuntu Pro for WSL agent. If this file is present, its modules will be
+   merged with (1), overriding any conflicting modules. If (1) is not provided,
+   then this file will be merged with any valid user-provided configuration
+   instead. Exception is made for Landscape client config computer tags. If
+   user provided data contains a value for ``landscape.client.tags`` it will be
+   used instead of the one provided by the ``agent.yaml``, which is treated as
+   a default.
+
+Then, if a file from (1) is not found, optional user-provided configuration
+will be looked for in the following order:
+
+1. ``%USERPROFILE%\.cloud-init\<InstanceName>.user-data`` holds user-data for a
    specific instance configuration. The datasource resolves the name attributed
    by WSL to the instance being initialized and looks for this file before any
    of the subsequent alternatives. Example: ``sid-mlkit.user-data`` matches an
@@ -84,41 +107,43 @@ Only the first match is loaded, and no config merging is done, even in the
 presence of errors. That avoids unexpected behaviour due to surprising merge
 scenarios. Also, notice that the file name casing is irrelevant since both the
 Windows file names, as well as the WSL distro names, are case-insensitive by
-default. If none are found, cloud-init remains disabled.
+default. If none are found, cloud-init remains disabled if no other
+configurations from previous steps were found.
 
 .. note::
    Some users may have configured case sensitivity for file names on Windows.
-   Note that user data files will still be matched case-insensitively. If there
+   Note that user-data files will still be matched case-insensitively. If there
    are both `InstanceName.user-data` and `instancename.user-data`, which one
    will be chosen is arbitrary and should not be relied on. Thus it's
    recommended to avoid that scenario to prevent confusion.
 
-Since WSL instances are scoped by the Windows user, having the user data files
+Since WSL instances are scoped by the Windows user, having the user-data files
 inside the ``%USERPROFILE%`` directory (typically ``C:\Users\<USERNAME>``)
 ensures that WSL instance initialization won't be subject to naming conflicts
 if the Windows host is shared by multiple users.
 
 
-Vendor and metadata
-===================
+Vendor-data and meta-data
+=========================
 
-The current implementation doesn't allow supplying vendor data.
-The reasoning is that vendor data adds layering, thus complexity, for no real
-benefit to the user. Supplying vendor data could be relevant to WSL itself, if
+The current implementation doesn't allow supplying vendor-data.
+The reasoning is that vendor-data adds layering, thus complexity, for no real
+benefit to the user. Supplying vendor-data could be relevant to WSL itself, if
 the subsystem was aware of cloud-init and intended to leverage it, which is not
 the case to the best of our knowledge at the time of this writing.
 
-Most of what ``metadata`` is intended for is not applicable under WSL, such as
-setting a hostname. Yet, the knowledge of ``metadata.instance-id`` is vital for
-cloud-init. So, this datasource provides a default value but also supports
-optionally sourcing metadata from a per-instance specific configuration file:
-``%USERPROFILE%\.cloud-init\<InstanceName>.meta-data``. If that file exists, it
-is a YAML-formatted file minimally providing a value for instance ID
-such as: ``instance-id: x-y-z``. Advanced users looking to share
-snapshots or relaunch a snapshot where cloud-init is re-triggered, must run
-``sudo cloud-init clean --logs`` on the instance before snapshot/export, or
-create the appropriate ``.meta-data`` file containing ``instance-id:
-some-new-instance-id``.
+Most of what ``meta-data`` is intended for is not applicable under WSL, such as
+setting a hostname. Yet, the knowledge of ``meta-data.instance-id`` is vital
+for cloud-init. So, this datasource provides a default value but also supports
+optionally sourcing meta-data from a per-instance specific configuration file
+located either at ``%USERPROFILE%\.cloud-init\<InstanceName>.meta-data`` or
+``%USERPROFILE%\.ubuntupro\.cloud-init\<InstanceName>.meta-data``. When both
+files exist, only the second will be loaded. The file must be a YAML-formatted
+file minimally providing a value for instance ID such as: ``instance-id:
+x-y-z``. Advanced users looking to share snapshots or relaunch a snapshot where
+cloud-init is re-triggered, must run ``sudo cloud-init clean --logs`` on the
+instance before snapshot/export, or create the appropriate ``.meta-data`` file
+containing ``instance-id: some-new-instance-id``.
 
 Unsupported or restricted modules and features
 ===============================================
@@ -130,9 +155,9 @@ files, please check the following restrictions:
 
 * File paths in an include file must be Linux absolute paths.
 
-  Users may be surprised with that requirement since the user data files are
+  Users may be surprised with that requirement since the user-data files are
   inside the Windows file system. But remember that cloud-init is still running
-  inside a Linux instance, and the files referenced in the include user data
+  inside a Linux instance, and the files referenced in the include user-data
   file will be read by cloud-init, thus they must be represented with paths
   understandable inside the Linux instance. Most users will find their Windows
   system drive mounted as `/mnt/c`, so let's consider that assumption in the
@@ -140,7 +165,7 @@ files, please check the following restrictions:
 
 ``C:\Users\Me\.cloud-init\noble-cpp.user-data``
 
-.. code-block::
+.. code-block:: yaml
 
    #include
    /mnt/c/Users/me/.cloud-init/config.user-data
@@ -169,8 +194,9 @@ include file.
   While creating users through cloud-init works as in any other platform, WSL
   has the concept of the *default user*, which is the user logged in by
   default. So, to create the default user with cloud-init, one must supply user
-  data to the :ref:`Users and Groups module <mod-users_groups>` and write the
-  entry in ``/etc/wsl.conf`` to make that user the default. See the example:
+  data to the :ref:`Users and Groups module <mod_cc_users_groups>` and write
+  the entry in ``/etc/wsl.conf`` to make that user the default. See the
+  example:
 
 .. code-block:: yaml
 
@@ -179,14 +205,14 @@ include file.
     - name: j
       gecos: Agent J
       groups: users,sudo,netdev,audio
-      sudo: ALL=(ALL) NOPASSWD:ALL
+      sudo: "ALL=(ALL) NOPASSWD:ALL"
       shell: /bin/bash
       lock_passwd: true
 
     write_files:
     - path: /etc/wsl.conf
       append: true
-      contents: |
+      content: |
         [user]
         default=j
 

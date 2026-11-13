@@ -9,6 +9,7 @@
 import functools
 import json
 import logging
+from typing import Dict, List
 
 from cloudinit import url_helper, util
 
@@ -63,8 +64,8 @@ class MetadataMaterializer:
             self._leaf_decoder = leaf_decoder
 
     def _parse(self, blob):
-        leaves = {}
-        children = []
+        leaves: Dict[str, str] = {}
+        children: List[str] = []
         blob = util.decode_binary(blob)
 
         if not blob:
@@ -97,7 +98,7 @@ class MetadataMaterializer:
                 resource = field_name
                 if len(contents) > 1:
                     # What a PITA...
-                    (ident, sub_contents) = contents
+                    ident, sub_contents = contents
                     ident = util.safe_int(ident)
                     if ident is not None:
                         resource = "%s/openssh-key" % (ident)
@@ -112,7 +113,7 @@ class MetadataMaterializer:
         return self._md
 
     def _materialize(self, blob, base_url):
-        (leaves, children) = self._parse(blob)
+        leaves, children = self._parse(blob)
         child_contents = {}
         for c in children:
             child_url = url_helper.combine_url(base_url, c)
@@ -121,7 +122,7 @@ class MetadataMaterializer:
             child_blob = self._caller(child_url)
             child_contents[c] = self._materialize(child_blob, child_url)
         leaf_contents = {}
-        for (field, resource) in leaves.items():
+        for field, resource in leaves.items():
             leaf_url = url_helper.combine_url(base_url, resource)
             leaf_blob = self._caller(leaf_url)
             leaf_contents[field] = self._leaf_decoder(field, leaf_blob)
@@ -135,7 +136,7 @@ class MetadataMaterializer:
         return joined
 
 
-def skip_retry_on_codes(status_codes, _request_args, cause):
+def skip_retry_on_codes(status_codes, cause):
     """Returns False if cause.code is in status_codes."""
     return cause.code not in status_codes
 
@@ -143,6 +144,7 @@ def skip_retry_on_codes(status_codes, _request_args, cause):
 def get_instance_userdata(
     api_version="latest",
     metadata_address="http://169.254.169.254",
+    *,
     ssl_details=None,
     timeout=5,
     retries=5,

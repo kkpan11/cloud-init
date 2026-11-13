@@ -8,11 +8,12 @@ import logging
 import os
 import re
 from io import StringIO
+from typing import List, Optional, Tuple
 
 import cloudinit.distros.bsd
 from cloudinit import subp, util
 from cloudinit.distros.networking import FreeBSDNetworking
-from cloudinit.settings import PER_INSTANCE
+from cloudinit.settings import PER_ALWAYS, PER_INSTANCE
 
 LOG = logging.getLogger(__name__)
 
@@ -35,11 +36,22 @@ class Distro(cloudinit.distros.bsd.BSD):
     pkg_cmd_update_prefix = ["pkg", "update"]
     pkg_cmd_upgrade_prefix = ["pkg", "upgrade"]
     prefer_fqdn = True  # See rc.conf(5) in FreeBSD
-    home_dir = "/usr/home"
+    home_dir = "/home"
     # FreeBSD has the following dhclient lease path:
     # /var/db/dhclient.leases.<iface_name>
     dhclient_lease_directory = "/var/db"
     dhclient_lease_file_regex = r"dhclient.leases.\w+"
+
+    # /etc/shadow match patterns indicating empty passwords
+    # For FreeBSD (from https://man.freebsd.org/cgi/man.cgi?passwd(5)) a
+    # password field of "" indicates no password, and a password
+    # field value of either "*" or "*LOCKED*" indicate differing forms of
+    # "locked" but with no password defined.
+    shadow_empty_locked_passwd_patterns = [
+        r"^{username}::",
+        r"^{username}:\*:",
+        r"^{username}:\*LOCKED\*:",
+    ]
 
     @classmethod
     def reload_init(cls, rcs=None):
@@ -86,11 +98,9 @@ class Distro(cloudinit.distros.bsd.BSD):
     def _get_add_member_to_group_cmd(self, member_name, group_name):
         return ["pw", "usermod", "-n", member_name, "-G", group_name]
 
-    def add_user(self, name, **kwargs):
-        if util.is_user(name):
-            LOG.info("User %s already exists, skipping.", name)
-            return False
-
+    def _build_add_user_cmd(
+        self, name: str, groups: List[str], **kwargs
+    ) -> Tuple[List[str], List[str]]:
         pw_useradd_cmd = ["pw", "useradd", "-n", name]
         log_pw_useradd_cmd = ["pw", "useradd", "-n", name]
 
@@ -98,7 +108,6 @@ class Distro(cloudinit.distros.bsd.BSD):
             "homedir": "-d",
             "gecos": "-c",
             "primary_group": "-g",
-            "groups": "-G",
             "shell": "-s",
             "inactive": "-E",
             "uid": "-u",
@@ -109,6 +118,8 @@ class Distro(cloudinit.distros.bsd.BSD):
             "no_log_init": "--no-log-init",
         }
 
+        if groups:
+            pw_useradd_cmd.extend(["-G", ",".join(groups)])
         for key, val in kwargs.items():
             if key in pw_useradd_opts and val and isinstance(val, (str, int)):
                 pw_useradd_cmd.extend([pw_useradd_opts[key], str(val)])
@@ -127,18 +138,18 @@ class Distro(cloudinit.distros.bsd.BSD):
             log_pw_useradd_cmd.append("-d" + homedir)
             log_pw_useradd_cmd.append("-m")
 
-        # Run the command
-        LOG.info("Adding user %s", name)
-        try:
-            subp.subp(pw_useradd_cmd, logstring=log_pw_useradd_cmd)
-        except Exception:
-            util.logexc(LOG, "Failed to create user %s", name)
-            raise
-        # Set the password if it is provided
-        # For security consideration, only hashed passwd is assumed
-        passwd_val = kwargs.get("passwd", None)
-        if passwd_val is not None:
-            self.set_passwd(name, passwd_val, hashed=True)
+        return pw_useradd_cmd, log_pw_useradd_cmd
+
+    def _post_add_user(
+        self,
+        name: str,
+        passwd: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        # Set the password if it is provided.
+        # For security consideration, only hashed passwd is assumed.
+        if passwd is not None:
+            self.set_passwd(name, passwd, hashed=True)
 
     def expire_passwd(self, user):
         try:
@@ -169,6 +180,13 @@ class Distro(cloudinit.distros.bsd.BSD):
         except Exception:
             util.logexc(LOG, "Failed to lock password login for user %s", name)
             raise
+
+    def unlock_passwd(self, name):
+        LOG.debug(
+            "Dragonfly BSD/FreeBSD password lock is not reversible, "
+            "ignoring unlock for user %s",
+            name,
+        )
 
     def apply_locale(self, locale, out_fn=None):
         # Adjust the locales value to the new value
@@ -203,12 +221,12 @@ class Distro(cloudinit.distros.bsd.BSD):
         operations"""
         return {"ASSUME_ALWAYS_YES": "YES"}
 
-    def update_package_sources(self):
+    def update_package_sources(self, *, force=False):
         self._runner.run(
             "update-sources",
             self.package_command,
             ["update"],
-            freq=PER_INSTANCE,
+            freq=PER_ALWAYS if force else PER_INSTANCE,
         )
 
     @staticmethod

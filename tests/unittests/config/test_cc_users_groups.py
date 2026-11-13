@@ -1,4 +1,5 @@
 # This file is part of cloud-init. See LICENSE file for license information.
+import logging
 import re
 
 import pytest
@@ -10,21 +11,20 @@ from cloudinit.config.schema import (
     validate_cloudconfig_schema,
 )
 from tests.unittests.helpers import (
-    CiTestCase,
+    assert_count_equal,
     does_not_raise,
     mock,
     skipUnlessJsonSchema,
 )
+from tests.unittests.util import get_cloud
 
 MODPATH = "cloudinit.config.cc_users_groups"
 
 
 @mock.patch("cloudinit.distros.ubuntu.Distro.create_group")
 @mock.patch("cloudinit.distros.ubuntu.Distro.create_user")
-class TestHandleUsersGroups(CiTestCase):
+class TestHandleUsersGroups:
     """Test cc_users_groups handling of config."""
-
-    with_logs = True
 
     def test_handle_no_cfg_creates_no_users_or_groups(self, m_user, m_group):
         """Test handle with no config will not create users or groups."""
@@ -39,12 +39,51 @@ class TestHandleUsersGroups(CiTestCase):
             }
         }
         metadata = {}
-        cloud = self.tmp_cloud(
-            distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata
-        )
+        cloud = get_cloud(distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata)
         cc_users_groups.handle("modulename", cfg, cloud, None)
         m_user.assert_not_called()
         m_group.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "groups_cfg,normalized_groups,deprecation_log",
+        (
+            pytest.param(
+                {"grp1": True, "grp2 ": True, "    ": True},
+                ["grp1", "grp2"],
+                "The user me2 has a 'groups' config value of type dict is"
+                " deprecated in 22.3",
+                id="groups-as-dict-ignores-whitespace",
+            ),
+            pytest.param(
+                " grp1,  ,grp2",
+                ["grp1", "grp2"],
+                None,
+                id="groups-comma-separated-with-whitespace",
+            ),
+        ),
+    )
+    def test_handle_users_in_cfg_normalizes_group_values(
+        self,
+        m_user,
+        m_group,
+        groups_cfg,
+        normalized_groups,
+        deprecation_log,
+        caplog,
+    ):
+        """Normalize values group config from str, dict and list."""
+        cfg = {"users": [{"name": "me2", "groups": groups_cfg}]}
+        cloud = get_cloud(distro="ubuntu", sys_cfg={}, metadata={})
+        with caplog.at_level(logging.INFO):
+            cc_users_groups.handle("modulename", cfg, cloud, None)
+        assert_count_equal(
+            m_user.call_args_list,
+            [
+                mock.call("me2", groups=normalized_groups, default=False),
+            ],
+        )
+        if deprecation_log:
+            assert deprecation_log in caplog.text
 
     def test_handle_users_in_cfg_calls_create_users(self, m_user, m_group):
         """When users in config, create users with distro.create_user."""
@@ -59,20 +98,18 @@ class TestHandleUsersGroups(CiTestCase):
             }
         }
         metadata = {}
-        cloud = self.tmp_cloud(
-            distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata
-        )
+        cloud = get_cloud(distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata)
         cc_users_groups.handle("modulename", cfg, cloud, None)
-        self.assertCountEqual(
+        assert_count_equal(
             m_user.call_args_list,
             [
                 mock.call(
                     "ubuntu",
-                    groups="lxd,sudo",
+                    groups=["lxd", "sudo"],
                     lock_passwd=True,
                     shell="/bin/bash",
                 ),
-                mock.call("me2", default=False),
+                mock.call("me2", groups=[], default=False),
             ],
         )
         m_group.assert_not_called()
@@ -105,21 +142,21 @@ class TestHandleUsersGroups(CiTestCase):
         with mock.patch(
             "cloudinit.distros.networking.subp.subp", return_value=("", None)
         ):
-            cloud = self.tmp_cloud(
+            cloud = get_cloud(
                 distro="freebsd", sys_cfg=sys_cfg, metadata=metadata
             )
         cc_users_groups.handle("modulename", cfg, cloud, None)
-        self.assertCountEqual(
+        assert_count_equal(
             m_fbsd_user.call_args_list,
             [
                 mock.call(
                     "freebsd",
-                    groups="wheel",
+                    groups=["wheel"],
                     lock_passwd=True,
                     shell="/bin/tcsh",
                     homedir="/home/freebsd",
                 ),
-                mock.call("me2", uid=1234, default=False),
+                mock.call("me2", groups=[], uid=1234, default=False),
             ],
         )
         m_fbsd_group.assert_not_called()
@@ -141,22 +178,21 @@ class TestHandleUsersGroups(CiTestCase):
             }
         }
         metadata = {"public-keys": ["key1"]}
-        cloud = self.tmp_cloud(
-            distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata
-        )
+        cloud = get_cloud(distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata)
         cc_users_groups.handle("modulename", cfg, cloud, None)
-        self.assertCountEqual(
+        assert_count_equal(
             m_user.call_args_list,
             [
                 mock.call(
                     "ubuntu",
-                    groups="lxd,sudo",
+                    groups=["lxd", "sudo"],
                     lock_passwd=True,
                     shell="/bin/bash",
                 ),
                 mock.call(
                     "me2",
                     cloud_public_ssh_keys=["key1"],
+                    groups=[],
                     default=False,
                     ssh_redirect_user="ubuntu",
                 ),
@@ -182,21 +218,20 @@ class TestHandleUsersGroups(CiTestCase):
             }
         }
         metadata = {"public-keys": ["key1"]}
-        cloud = self.tmp_cloud(
-            distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata
-        )
+        cloud = get_cloud(distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata)
         cc_users_groups.handle("modulename", cfg, cloud, None)
-        self.assertCountEqual(
+        assert_count_equal(
             m_user.call_args_list,
             [
                 mock.call(
                     "ubuntu",
-                    groups="lxd,sudo",
+                    groups=["lxd", "sudo"],
                     lock_passwd=True,
                     shell="/bin/bash",
                 ),
                 mock.call(
                     "me2",
+                    groups=[],
                     cloud_public_ssh_keys=["key1"],
                     default=False,
                     ssh_redirect_user="ubuntu",
@@ -216,15 +251,14 @@ class TestHandleUsersGroups(CiTestCase):
                 },
             ]
         }
-        cloud = self.tmp_cloud(distro="ubuntu", sys_cfg={}, metadata={})
-        with self.assertRaises(ValueError) as context_manager:
+        cloud = get_cloud(distro="ubuntu", sys_cfg={}, metadata={})
+        with pytest.raises(
+            ValueError,
+            match=r"Not creating user me2. Key\(s\) ssh_import_id cannot be"
+            " provided with no_create_home",
+        ):
             cc_users_groups.handle("modulename", cfg, cloud, None)
         m_group.assert_not_called()
-        self.assertEqual(
-            "Not creating user me2. Key(s) ssh_import_id cannot be provided"
-            " with no_create_home",
-            str(context_manager.exception),
-        )
 
     def test_users_with_ssh_redirect_user_non_default(self, m_user, m_group):
         """Warn when ssh_redirect_user is not 'default'."""
@@ -244,17 +278,14 @@ class TestHandleUsersGroups(CiTestCase):
             }
         }
         metadata = {"public-keys": ["key1"]}
-        cloud = self.tmp_cloud(
-            distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata
-        )
-        with self.assertRaises(ValueError) as context_manager:
+        cloud = get_cloud(distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata)
+        with pytest.raises(
+            ValueError,
+            match="Not creating user me2. Invalid value of ssh_redirect_user:"
+            " snowflake. Expected values: true, default or false.",
+        ):
             cc_users_groups.handle("modulename", cfg, cloud, None)
         m_group.assert_not_called()
-        self.assertEqual(
-            "Not creating user me2. Invalid value of ssh_redirect_user:"
-            " snowflake. Expected values: true, default or false.",
-            str(context_manager.exception),
-        )
 
     def test_users_with_ssh_redirect_user_default_false(self, m_user, m_group):
         """When unspecified ssh_redirect_user is false and not set up."""
@@ -269,25 +300,25 @@ class TestHandleUsersGroups(CiTestCase):
             }
         }
         metadata = {"public-keys": ["key1"]}
-        cloud = self.tmp_cloud(
-            distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata
-        )
+        cloud = get_cloud(distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata)
         cc_users_groups.handle("modulename", cfg, cloud, None)
-        self.assertCountEqual(
+        assert_count_equal(
             m_user.call_args_list,
             [
                 mock.call(
                     "ubuntu",
-                    groups="lxd,sudo",
+                    groups=["lxd", "sudo"],
                     lock_passwd=True,
                     shell="/bin/bash",
                 ),
-                mock.call("me2", default=False),
+                mock.call("me2", groups=[], default=False),
             ],
         )
         m_group.assert_not_called()
 
-    def test_users_ssh_redirect_user_and_no_default(self, m_user, m_group):
+    def test_users_ssh_redirect_user_and_no_default(
+        self, m_user, m_group, caplog
+    ):
         """Warn when ssh_redirect_user is True and no default user present."""
         cfg = {
             "users": ["default", {"name": "me2", "ssh_redirect_user": True}]
@@ -295,18 +326,49 @@ class TestHandleUsersGroups(CiTestCase):
         # System config defines *no* default user for the distro.
         sys_cfg = {}
         metadata = {}  # no public-keys defined
-        cloud = self.tmp_cloud(
-            distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata
-        )
+        cloud = get_cloud(distro="ubuntu", sys_cfg=sys_cfg, metadata=metadata)
         cc_users_groups.handle("modulename", cfg, cloud, None)
-        m_user.assert_called_once_with("me2", default=False)
+        m_user.assert_called_once_with("me2", groups=[], default=False)
         m_group.assert_not_called()
-        self.assertEqual(
-            "WARNING: Ignoring ssh_redirect_user: True for me2. No"
-            " default_user defined. Perhaps missing"
-            " cloud configuration users:  [default, ..].\n",
-            self.logs.getvalue(),
+        assert [
+            (
+                mock.ANY,
+                logging.WARNING,
+                (
+                    "Ignoring ssh_redirect_user: True for me2. No"
+                    " default_user defined. Perhaps missing"
+                    " cloud configuration users:  [default, ..]."
+                ),
+            )
+        ] == caplog.record_tuples
+
+    @pytest.mark.parametrize(
+        "groups_val", ("group1, group2", {"group1": True, "group2": True})
+    )
+    @mock.patch(MODPATH + ".lifecycle.deprecate")
+    def test_user_groups_normalized_to_list(
+        self, m_deprecate, m_user, m_group, groups_val, caplog, capsys
+    ):
+        cfg = {"users": [{"name": "me2", "groups": groups_val}]}
+        cloud = get_cloud(distro="ubuntu", sys_cfg={}, metadata={})
+
+        cc_users_groups.handle("modulename", cfg, cloud, None)
+
+        m_user.assert_called_once_with(
+            "me2", default=False, groups=["group1", "group2"]
         )
+        m_group.assert_not_called()
+        if isinstance(groups_val, dict):
+            m_deprecate.assert_called_once_with(
+                deprecated=(
+                    "The user me2 has a 'groups' config value of type dict"
+                ),
+                deprecated_version="22.3",
+                extra_message=(
+                    "Use a comma-delimited string or array instead:"
+                    " group1,group2."
+                ),
+            )
 
 
 class TestUsersGroupsSchema:
@@ -372,10 +434,25 @@ class TestUsersGroupsSchema:
                 pytest.raises(
                     SchemaValidationError,
                     match=(
-                        "Cloud config schema deprecations: "
-                        "users.0.lock-passwd: Default: ``true`` "
-                        "Deprecated in version 22.3. Use "
-                        "``lock_passwd`` instead."
+                        re.escape(
+                            "Cloud config schema deprecations: "
+                            "users.0.lock-passwd:  Deprecated in version 22.3."
+                            " Use **lock_passwd** instead."
+                        )
+                    ),
+                ),
+                False,
+            ),
+            (
+                {"users": [{"name": "bbsw", "no-create-home": True}]},
+                pytest.raises(
+                    SchemaValidationError,
+                    match=(
+                        re.escape(
+                            "Cloud config schema deprecations: "
+                            "users.0.no-create-home:  Deprecated in version"
+                            " 24.2. Use **no_create_home** instead."
+                        )
                     ),
                 ),
                 False,
@@ -396,13 +473,10 @@ class TestUsersGroupsSchema:
                     SchemaValidationError,
                     match=(
                         "Cloud config schema deprecations: "
-                        "users.0.groups.adm: When providing an object "
-                        "for users.groups the ``<group_name>`` keys "
-                        "are the groups to add this user to Deprecated"
-                        " in version 23.1., users.0.groups.sudo: When "
-                        "providing an object for users.groups the "
-                        "``<group_name>`` keys are the groups to add "
-                        "this user to Deprecated in version 23.1."
+                        "users.0.groups.adm:  Deprecated in version 23.1. "
+                        "The use of ``object`` type is deprecated. Use "
+                        "``string`` or ``array`` of ``string`` instead., "
+                        "users.0.groups.sudo:  Deprecated in version 23.1."
                     ),
                 ),
                 False,
@@ -458,10 +532,7 @@ class TestUsersGroupsSchema:
                     SchemaValidationError,
                     match=(
                         "Cloud config schema deprecations: "
-                        "user.groups.sbuild: When providing an object "
-                        "for users.groups the ``<group_name>`` keys "
-                        "are the groups to add this user to Deprecated"
-                        " in version 23.1."
+                        "user.groups.sbuild:  Deprecated in version 23.1."
                     ),
                 ),
                 False,
@@ -522,15 +593,17 @@ class TestUsersGroupsSchema:
                 pytest.raises(
                     SchemaValidationError,
                     match=(
-                        "Cloud config schema deprecations: "
-                        "users.0.ssh-authorized-keys: "
-                        " Deprecated in version 18.3."
-                        " Use ``ssh_authorized_keys`` instead."
-                        ", "
-                        "users.0.uid: "
-                        " Changed in version 22.3."
-                        " The use of ``string`` type is deprecated."
-                        " Use an ``integer`` instead."
+                        re.escape(
+                            "Cloud config schema deprecations: "
+                            "users.0.ssh-authorized-keys: "
+                            " Deprecated in version 18.3."
+                            " Use **ssh_authorized_keys** instead."
+                            ", "
+                            "users.0.uid: "
+                            " Changed in version 22.3."
+                            " The use of ``string`` type is deprecated."
+                            " Use an ``integer`` instead."
+                        )
                     ),
                 ),
                 False,

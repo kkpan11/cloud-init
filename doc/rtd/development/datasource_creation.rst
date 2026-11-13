@@ -82,8 +82,8 @@ and/or unused may be considered for eventual removal.
 Adding cloud-init support
 =========================
 
-There are multiple ways to provide `user data`, `metadata`, and
-`vendor data`, and each cloud solution prefers its own way. A datasource
+There are multiple ways to provide `user-data`, `meta-data`, and
+`vendor-data`, and each cloud solution prefers its own way. A datasource
 abstract base class defines a single interface to interact with the different
 clouds. Each cloud implementation must inherit from this base class to use this
 shared functionality and interface. See :file:`cloud-init/sources/__init__.py`
@@ -158,10 +158,11 @@ packaging configuration.
 Add documentation for your datasource
 -------------------------------------
 
-You should add a new file in
-:file:`doc/rtd/reference/datasources/<cloudplatform>.rst`
-and reference it in
-:file:`doc/rtd/reference/datasources.rst`
+You should update the following docs:
+1. Add a new file in :file:`doc/rtd/reference/datasources/<cloudplatform>.rst`
+2. Reference `<cloudplatform>.rst` in :file:`doc/rtd/reference/datasources.rst`
+3. Add an alphebetized dsname entry in representing your datasource
+:file:`doc/rtd/reference/datasource_dsname_map.rst`
 
 Benefits of including your datasource in upstream cloud-init
 ============================================================
@@ -170,10 +171,12 @@ Datasources included in upstream cloud-init benefit from ongoing maintenance,
 compatibility with the rest of the codebase, and security fixes by the upstream
 development team.
 
+If this is not possible, one can add
+:ref:`custom out-of-tree datasources<custom_datasource>` to cloud-init.
 
-.. _make-mime: https://cloudinit.readthedocs.io/en/latest/explanation/instancedata.html#storage-locations
+.. _make-mime: https://docs.cloud-init.io/en/latest/explanation/instancedata.html#storage-locations
 .. _DMI: https://www.dmtf.org/sites/default/files/standards/documents/DSP0005.pdf
 .. _Libvirt: https://github.com/virt-manager/virt-manager/blob/main/man/virt-install.rst#--cloud-init
 .. _Proxmox: https://pve.proxmox.com/wiki/Cloud-Init_Support
 .. _DatasourceNoCloud.py: https://github.com/canonical/cloud-init/blob/main/cloudinit/sources/DataSourceNoCloud.py
-.. _nocloud: https://cloudinit.readthedocs.io/en/latest/reference/datasources/nocloud.html
+.. _nocloud: https://docs.cloud-init.io/en/latest/reference/datasources/nocloud.html

@@ -13,13 +13,12 @@ import logging
 import os
 import re
 import stat
-from textwrap import dedent
 from typing import Optional
 
-from cloudinit import subp, util
+from cloudinit import lifecycle, subp, util
 from cloudinit.cloud import Cloud
 from cloudinit.config import Config
-from cloudinit.config.schema import MetaSchema, get_meta_doc
+from cloudinit.config.schema import MetaSchema
 from cloudinit.distros import ALL_DISTROS
 from cloudinit.settings import PER_ALWAYS
 
@@ -27,30 +26,10 @@ NOBLOCK = "noblock"
 
 meta: MetaSchema = {
     "id": "cc_resizefs",
-    "name": "Resizefs",
-    "title": "Resize filesystem",
-    "description": dedent(
-        """\
-        Resize a filesystem to use all available space on partition. This
-        module is useful along with ``cc_growpart`` and will ensure that if the
-        root partition has been resized the root filesystem will be resized
-        along with it. By default, ``cc_resizefs`` will resize the root
-        partition and will block the boot process while the resize command is
-        running. Optionally, the resize operation can be performed in the
-        background while cloud-init continues running modules. This can be
-        enabled by setting ``resize_rootfs`` to ``noblock``. This module can be
-        disabled altogether by setting ``resize_rootfs`` to ``false``."""
-    ),
     "distros": [ALL_DISTROS],
-    "examples": [
-        "resize_rootfs: false  # disable root filesystem resize operation",
-        "resize_rootfs: noblock  # runs resize operation in the background",
-    ],
     "frequency": PER_ALWAYS,
     "activate_by_schema_keys": [],
 }
-
-__doc__ = get_meta_doc(meta)
 
 LOG = logging.getLogger(__name__)
 
@@ -77,9 +56,12 @@ def _resize_btrfs(mount_point, devpth):
     # btrfs has exclusive operations and resize may fail if btrfs is busy
     # doing one of the operations that prevents resize. As of btrfs 5.10
     # the resize operation can be queued
-    btrfs_with_queue = util.Version.from_str("5.10")
-    system_btrfs_ver = util.Version.from_str(
-        subp.subp(["btrfs", "--version"])[0].split("v")[-1].strip()
+    btrfs_with_queue = lifecycle.Version.from_str("5.10")
+    system_btrfs_ver = lifecycle.Version.from_str(
+        subp.subp(["btrfs", "--version"])
+        .stdout.split("\n")[0]
+        .split("v")[-1]
+        .strip()
     )
     if system_btrfs_ver >= btrfs_with_queue:
         idx = cmd.index("resize")
@@ -193,7 +175,7 @@ def maybe_get_writable_device_path(devpath, info):
     @param info: String representing information about the requested device.
     @param log: Logger to which logs will be added upon error.
 
-    @returns devpath or updated devpath per kernel commandline if the device
+    @returns devpath or updated devpath per kernel command line if the device
         path is a writable block device, returns None otherwise.
     """
     container = util.is_container()
@@ -267,7 +249,7 @@ def maybe_get_writable_device_path(devpath, info):
 
 
 def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
-    if len(args) != 0:
+    if args:
         resize_root = args[0]
     else:
         resize_root = util.get_cfg_option_str(cfg, "resize_rootfs", True)
@@ -282,7 +264,7 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
         LOG.warning("Could not determine filesystem type of %s", resize_what)
         return
 
-    (devpth, fs_type, mount_point) = result
+    devpth, fs_type, mount_point = result
 
     # if we have a zfs then our device path at this point
     # is the zfs label. For example: vmzroot/ROOT/freebsd
@@ -311,7 +293,7 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
         return
 
     fstype_lc = fs_type.lower()
-    for (pfix, root_cmd) in RESIZE_FS_PREFIXES_CMDS:
+    for pfix, root_cmd in RESIZE_FS_PREFIXES_CMDS:
         if fstype_lc.startswith(pfix):
             resizer = root_cmd
             break
@@ -333,20 +315,11 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
         # Fork to a child that will run
         # the resize command
         util.fork_cb(
-            util.log_time,
-            logfunc=LOG.debug,
-            msg="backgrounded Resizing",
-            func=do_resize,
-            args=(resize_cmd,),
+            do_resize,
+            resize_cmd,
         )
     else:
-        util.log_time(
-            logfunc=LOG.debug,
-            msg="Resizing",
-            func=do_resize,
-            args=(resize_cmd,),
-        )
-
+        do_resize(resize_cmd)
     action = "Resized"
     if resize_root == NOBLOCK:
         action = "Resizing (via forking)"

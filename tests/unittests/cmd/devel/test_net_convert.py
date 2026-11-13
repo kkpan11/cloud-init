@@ -1,13 +1,13 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
 import itertools
+from unittest import mock
 
 import pytest
 import yaml
 
 from cloudinit.cmd.devel import net_convert
 from cloudinit.distros.debian import NETWORK_FILE_HEADER
-from tests.unittests.helpers import mock
 
 M_PATH = "cloudinit.cmd.devel.net_convert."
 
@@ -54,7 +54,6 @@ Name=eth0
 
 [Network]
 DHCP=ipv4
-
 """
 
 SAMPLE_SYSCONFIG_CONTENT = """\
@@ -97,7 +96,7 @@ def mock_setup_logging():
     WARNING level, which would be a side-effect for future tests.
     It's behavior isn't checked in these tests, so mock it out.
     """
-    with mock.patch(f"{M_PATH}log.setup_basic_logging"):
+    with mock.patch(f"{M_PATH}loggers.setup_basic_logging"):
         yield
 
 

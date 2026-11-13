@@ -14,7 +14,10 @@ import yaml
 
 from tests.integration_tests.decorators import retry
 from tests.integration_tests.releases import CURRENT_RELEASE, IS_UBUNTU
-from tests.integration_tests.util import get_console_log
+from tests.integration_tests.util import (
+    fetch_and_parse_etc_shadow,
+    get_console_log,
+)
 
 COMMON_USER_DATA = """\
 #cloud-config
@@ -38,13 +41,14 @@ Uh69tP4GSrGW5XKHxMLiKowJgm/"
     # sha256 gojanego
     passwd: "$5$iW$XsxmWCdpwIW8Yhv.Jn/R3uk6A4UaicfW5Xp7C9p9pg."
     lock_passwd: false
+  - name: sally
+    # sha256 gosallygo
+    passwd: "$5$bA$KBMTe8lXf0e8lE4f4hYPU0h6h0HzQX4vHpnq6xHn9Q2"
   - name: "mikey"
     lock_passwd: false
 """
 
-LIST_USER_DATA = (
-    COMMON_USER_DATA
-    + """
+LIST_USER_DATA = COMMON_USER_DATA + """
 chpasswd:
   list:
     - tom:mypassword123!
@@ -52,11 +56,8 @@ chpasswd:
     - harry:RANDOM
     - mikey:$5$xZ$B2YGGEx2AOf4PeW48KC6.QyT1W2B4rZ9Qbltudtha89
 """
-)
 
-STRING_USER_DATA = (
-    COMMON_USER_DATA
-    + """
+STRING_USER_DATA = COMMON_USER_DATA + """
 chpasswd:
     list: |
       tom:mypassword123!
@@ -64,11 +65,8 @@ chpasswd:
       harry:RANDOM
       mikey:$5$xZ$B2YGGEx2AOf4PeW48KC6.QyT1W2B4rZ9Qbltudtha89
 """
-)
 
-USERS_USER_DATA = (
-    COMMON_USER_DATA
-    + """
+USERS_USER_DATA = COMMON_USER_DATA + """
 chpasswd:
   users:
     - name: tom
@@ -81,7 +79,6 @@ chpasswd:
     - name: mikey
       password: $5$xZ$B2YGGEx2AOf4PeW48KC6.QyT1W2B4rZ9Qbltudtha89
 """
-)
 
 USERS_DICTS = yaml.safe_load(COMMON_USER_DATA)["users"]
 USERS_PASSWD_VALUES = {
@@ -90,45 +87,53 @@ USERS_PASSWD_VALUES = {
     if "name" in user_dict and "passwd" in user_dict
 }
 
+SSSD_HASHED_PASSWD = (
+    "$6$lp2153951$Iq7BfvEAR8qyz9eKAKs5sAGBBtyDoSRW0D2FnBJdG3Xy5.rLbSh29Hrds0"
+    "VXSNzIx/1PNNmATPReqLjginX7/."
+)
+
+SSD_USER_DATA = f"""\
+#cloud-config
+package_update: true
+packages: [sssd-tools]
+users:
+- default
+- name: tuser
+  lock_passwd: false
+  hashed_passwd: {SSSD_HASHED_PASSWD}
+"""
+
 
 class Mixin:
     """Shared test definitions."""
 
-    def _fetch_and_parse_etc_shadow(self, class_client):
-        """Fetch /etc/shadow and parse it into Python data structures
-
-        Returns: ({user: password}, [duplicate, users])
-        """
-        shadow_content = class_client.read_from_file("/etc/shadow")
-        users = {}
-        dupes = []
-        for line in shadow_content.splitlines():
-            user, encpw = line.split(":")[0:2]
-            if user in users:
-                dupes.append(user)
-            users[user] = encpw
-        return users, dupes
-
     def test_no_duplicate_users_in_shadow(self, class_client):
         """Confirm that set_passwords has not added duplicate shadow entries"""
-        _, dupes = self._fetch_and_parse_etc_shadow(class_client)
+        _, dupes = fetch_and_parse_etc_shadow(class_client)
 
         assert [] == dupes
 
     def test_password_in_users_dict_set_correctly(self, class_client):
         """Test that the password specified in the users dict is set."""
-        shadow_users, _ = self._fetch_and_parse_etc_shadow(class_client)
+        shadow_users, _ = fetch_and_parse_etc_shadow(class_client)
         assert USERS_PASSWD_VALUES["jane"] == shadow_users["jane"]
+
+    def test_hashed_password_without_lock_passwd_override_is_locked(
+        self, class_client
+    ):
+        """Hashed passwords are locked when lock_passwd is not set."""
+        shadow_users, _ = fetch_and_parse_etc_shadow(class_client)
+        assert f"!{USERS_PASSWD_VALUES['sally']}" == shadow_users["sally"]
 
     def test_password_in_chpasswd_list_set_correctly(self, class_client):
         """Test that a chpasswd password overrides one in the users dict."""
-        shadow_users, _ = self._fetch_and_parse_etc_shadow(class_client)
+        shadow_users, _ = fetch_and_parse_etc_shadow(class_client)
         mikey_hash = "$5$xZ$B2YGGEx2AOf4PeW48KC6.QyT1W2B4rZ9Qbltudtha89"
         assert mikey_hash == shadow_users["mikey"]
 
     def test_random_passwords_set_correctly(self, class_client):
         """Test that RANDOM chpasswd entries replace users dict passwords."""
-        shadow_users, _ = self._fetch_and_parse_etc_shadow(class_client)
+        shadow_users, _ = fetch_and_parse_etc_shadow(class_client)
 
         # These should have been changed
         assert shadow_users["harry"] != USERS_PASSWD_VALUES["harry"]
@@ -170,7 +175,7 @@ class Mixin:
         )
         if minor_version > 12:
             pytest.xfail("Instance under test doesn't have 'crypt' in stdlib")
-        shadow_users, _ = self._fetch_and_parse_etc_shadow(class_client)
+        shadow_users, _ = fetch_and_parse_etc_shadow(class_client)
 
         fmt_and_salt = shadow_users["tom"].rsplit("$", 1)[0]
 
@@ -212,7 +217,10 @@ class Mixin:
     def test_sshd_config(self, class_client):
         """Test that SSH password auth is enabled."""
         sshd_config = class_client.execute("sshd -T").stdout
-        assert "passwordauthentication yes" in sshd_config
+        assert (
+            "passwordauthentication yes" in sshd_config
+            or "PasswordAuthentication yes" in sshd_config
+        )
 
 
 @pytest.mark.user_data(LIST_USER_DATA)
@@ -229,3 +237,19 @@ class TestPasswordListString(Mixin):
 @pytest.mark.user_data(USERS_USER_DATA)
 class TestPasswordUsersList(Mixin):
     """Launch an instance with USERS_USER_DATA, ensure Mixin tests pass."""
+
+
+@pytest.mark.user_data(SSD_USER_DATA)
+@pytest.mark.skipif(not IS_UBUNTU, reason="Requires dpkg")
+def test_unlock_passwd_stderr_does_not_delete_hashed_password(client):
+    """Ensure passwd -u does not delete hashed password on unrelated stderr"""
+    assert client.execute("dpkg -s sssd-tools").ok
+    assert client.execute("cloud-init clean --logs").ok
+    client.restart()
+    assert client.execute("cloud-init status --wait").ok
+
+    log = client.read_from_file("/var/log/cloud-init.log")
+    assert "['passwd', '-d', 'tuser']" not in log
+    shadow_entry = client.execute("getent shadow tuser")
+    assert shadow_entry.ok
+    assert shadow_entry.split(":")[1] == SSSD_HASHED_PASSWD

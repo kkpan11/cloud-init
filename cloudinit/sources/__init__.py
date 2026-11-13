@@ -15,13 +15,20 @@ import logging
 import os
 import pickle
 import re
-from collections import namedtuple
 from enum import Enum, unique
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union, cast
 
-from cloudinit import atomic_helper, dmi, importer, net, type_utils
-from cloudinit import user_data as ud
-from cloudinit import util
+from cloudinit import (
+    atomic_helper,
+    dmi,
+    importer,
+    lifecycle,
+    net,
+    performance,
+    type_utils,
+    user_data,
+    util,
+)
 from cloudinit.atomic_helper import write_json
 from cloudinit.distros import Distro
 from cloudinit.event import EventScope, EventType
@@ -169,20 +176,24 @@ def redact_sensitive_keys(metadata, redact_value=REDACT_SENSITIVE_VALUE):
     return md_copy
 
 
-URLParams = namedtuple(
-    "URLParams",
-    [
-        "max_wait_seconds",
-        "timeout_seconds",
-        "num_retries",
-        "sec_between_retries",
-    ],
-)
+class URLParams(NamedTuple):
+    max_wait_seconds: int
+    timeout_seconds: int
+    num_retries: int
+    sec_between_retries: int
 
-DataSourceHostname = namedtuple(
-    "DataSourceHostname",
-    ["hostname", "is_default"],
-)
+
+class DataSourceHostname(NamedTuple):
+    hostname: Optional[str]
+    is_default: bool
+
+
+class HotplugRetrySettings(NamedTuple):
+    """in seconds"""
+
+    force_retry: bool
+    sleep_period: int
+    sleep_total: int
 
 
 class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
@@ -195,7 +206,7 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
     dsname = "_undef"
 
     # Cached cloud_name as determined by _get_cloud_name
-    _cloud_name = None
+    _cloud_name: Optional[str] = None
 
     # Cached cloud platform api type: e.g. ec2, openstack, kvm, lxd, azure etc.
     _platform_type = None
@@ -308,6 +319,14 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
     # in the updated metadata
     skip_hotplug_detect = False
 
+    # AWS interface data propagates to the IMDS without a synchronization
+    # method. Since no better alternative exists, use a datasource-specific
+    # mechanism which retries periodically for a set amount of time - apply
+    # configuration as needed. Do not force retry on other datasources.
+    #
+    # https://github.com/amazonlinux/amazon-ec2-net-utils/blob/601bc3513fa7b8a6ab46d9496b233b079e55f2e9/lib/lib.sh#L483
+    hotplug_retry_settings = HotplugRetrySettings(False, 0, 0)
+
     # Extra udev rules for cc_install_hotplug
     extra_hotplug_udev_rules: Optional[str] = None
 
@@ -317,15 +336,15 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
         self.sys_cfg = sys_cfg
         self.distro = distro
         self.paths = paths
-        self.userdata = None
+        self.userdata: Optional[Any] = None
         self.metadata: dict = {}
-        self.userdata_raw: Optional[str] = None
+        self.userdata_raw: Optional[Union[str, bytes]] = None
         self.vendordata = None
         self.vendordata2 = None
-        self.vendordata_raw = None
+        self.vendordata_raw: Optional[Union[str, bytes]] = None
         self.vendordata2_raw = None
-        self.metadata_address = None
-        self.network_json = UNSET
+        self.metadata_address: Optional[str] = None
+        self.network_json: Optional[str] = UNSET
         self.ec2_metadata = UNSET
 
         self.ds_cfg = util.get_cfg_by_path(
@@ -335,7 +354,7 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
             self.ds_cfg = {}
 
         if not ud_proc:
-            self.ud_proc = ud.UserDataProcessor(self.paths)
+            self.ud_proc = user_data.UserDataProcessor(self.paths)
         else:
             self.ud_proc = ud_proc
 
@@ -352,6 +371,7 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
             "skip_hotplug_detect": False,
             "vendordata2": None,
             "vendordata2_raw": None,
+            "hotplug_retry_settings": HotplugRetrySettings(False, 0, 0),
         }
         for key, value in expected_attrs.items():
             if not hasattr(self, key):
@@ -359,7 +379,6 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
 
         if not hasattr(self, "check_if_fallback_is_allowed"):
             setattr(self, "check_if_fallback_is_allowed", lambda: False)
-
         if hasattr(self, "userdata") and self.userdata is not None:
             # If userdata stores MIME data, on < python3.6 it will be
             # missing the 'policy' attribute that exists on >=python3.6.
@@ -386,7 +405,7 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
     def override_ds_detect(self) -> bool:
         """Override if either:
         - only a single datasource defined (nothing to fall back to)
-        - commandline argument is used (ci.ds=OpenStack)
+        - command line argument is used (ci.ds=OpenStack)
 
         Note: get_cmdline() is required for the general case - when ds-identify
         does not run, _something_ needs to detect the kernel command line
@@ -394,14 +413,13 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
         """
         if self.dsname.lower() == parse_cmdline().lower():
             LOG.debug(
-                "Machine is configured by the kernel commandline to run on "
-                "single datasource %s.",
+                "Kernel command line set to use a single datasource %s.",
                 self,
             )
             return True
         elif self.sys_cfg.get("datasource_list", []) == [self.dsname]:
             LOG.debug(
-                "Machine is configured to run on single datasource %s.", self
+                "Datasource list set to use a single datasource %s.", self
             )
             return True
         return False
@@ -412,12 +430,12 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
             return self._get_data()
         elif self.ds_detect():
             LOG.debug(
-                "Detected platform: %s. Checking for active instance data",
+                "Detected %s",
                 self,
             )
             return self._get_data()
         else:
-            LOG.debug("Datasource type %s is not detected.", self)
+            LOG.debug("Did not detect %s", self)
             return False
 
     def _get_standardized_metadata(self, instance_data):
@@ -477,6 +495,7 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
         if not attr_defaults:
             self._dirty_cache = False
 
+    @performance.timed("Getting metadata", log_mode="always")
     def get_data(self) -> bool:
         """Datasources implement _get_data to setup metadata and userdata_raw.
 
@@ -484,6 +503,12 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
         """
         self._dirty_cache = True
         return_value = self._check_and_get_data()
+        # TODO: verify that datasource types are what they are expected to be
+        # each datasource uses different logic to get userdata, metadata, etc
+        # and then the rest of the codebase assumes the types of this data
+        # it would be prudent to have a type check here that warns, when the
+        # datatype is incorrect, rather than assuming types and throwing
+        # exceptions later if/when they get used incorrectly.
         if not return_value:
             return return_value
         self.persist_instance_data()
@@ -505,7 +530,17 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
         if self._crawled_metadata is not None:
             # Any datasource with _crawled_metadata will best represent
             # most recent, 'raw' metadata
-            crawled_metadata = copy.deepcopy(self._crawled_metadata)
+            #
+            # TODO: This type is known internally, so it is possible
+            # to narrow the type (this cast shouldn't be necessary).
+            # However that would require rewriting code across various
+            # datasource modules, so for now just assume that the type is
+            # correct and let the code throw an exception when it isn't.
+            # This allows us to enable type checking on this module even
+            # if it doesn't benefit this piece of code.
+            crawled_metadata = cast(
+                dict, copy.deepcopy(self._crawled_metadata)
+            )
             crawled_metadata.pop("user-data", None)
             crawled_metadata.pop("vendor-data", None)
             instance_data = {"ds": crawled_metadata}
@@ -726,10 +761,6 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
             new_ud = f.apply(new_ud)
         return new_ud
 
-    @property
-    def is_disconnected(self):
-        return False
-
     def get_userdata_raw(self):
         return self.userdata_raw
 
@@ -764,7 +795,7 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
         # we want to return the correct value for what will actually
         # exist in this instance
         mappings = {"sd": ("vd", "xvd", "vtb")}
-        for (nfrom, tlist) in mappings.items():
+        for nfrom, tlist in mappings.items():
             if not short_name.startswith(nfrom):
                 continue
             for nto in tlist:
@@ -818,7 +849,7 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
         @param metadata_only: Boolean, set True to avoid looking up hostname
             if meta-data doesn't have local-hostname present.
 
-        @return: a DataSourceHostname namedtuple
+        @return: a DataSourceHostname NamedTuple
             <hostname or qualified hostname>, <is_default> (str, bool).
             is_default is a bool and
             it's true only if hostname is localhost and was
@@ -1000,12 +1031,19 @@ class DataSource(CloudInitPickleMixin, metaclass=abc.ABCMeta):
         """
         return
 
+    def clean(self):
+        """
+        Called when the user issues 'cloud-init clean -c datasource'
+        command.
+        Individual data sources should implement their own cleanup handler.
+        """
+        return
+
 
 def normalize_pubkey_data(pubkey_data):
-    keys = []
 
     if not pubkey_data:
-        return keys
+        return []
 
     if isinstance(pubkey_data, str):
         return pubkey_data.splitlines()
@@ -1014,7 +1052,8 @@ def normalize_pubkey_data(pubkey_data):
         return list(pubkey_data)
 
     if isinstance(pubkey_data, (dict)):
-        for (_keyname, klist) in pubkey_data.items():
+        keys = []
+        for _keyname, klist in pubkey_data.items():
             # lp:506332 uec metadata service responds with
             # data that makes boto populate a string for 'klist' rather
             # than a list.
@@ -1026,8 +1065,8 @@ def normalize_pubkey_data(pubkey_data):
                     # the end of the keylist, trim it
                     if pkey:
                         keys.append(pkey)
-
-    return keys
+        return keys
+    return []
 
 
 def find_source(
@@ -1124,7 +1163,7 @@ def canonical_cloud_id(cloud_name, region, platform):
             return cloud_name
         return platform
     for prefix, cloud_id_test in CLOUD_ID_REGION_PREFIX_MAP.items():
-        (cloud_id, valid_cloud) = cloud_id_test
+        cloud_id, valid_cloud = cloud_id_test
         if region.startswith(prefix) and valid_cloud(cloud_name):
             return cloud_id
     if cloud_name != METADATA_UNKNOWN:
@@ -1170,7 +1209,7 @@ class BrokenMetadata(IOError):
 def list_from_depends(depends, ds_list):
     ret_list = []
     depset = set(depends)
-    for (cls, deps) in ds_list:
+    for cls, deps in ds_list:
         if depset == set(deps):
             ret_list.append(cls)
     return ret_list
@@ -1230,9 +1269,9 @@ def parse_cmdline_or_dmi(input: str) -> str:
     deprecated = ds_parse_1 or ds_parse_2
     if deprecated:
         dsname = deprecated.group(1).strip()
-        util.deprecate(
+        lifecycle.deprecate(
             deprecated=(
-                f"Defining the datasource on the commandline using "
+                f"Defining the datasource on the command line using "
                 f"ci.ds={dsname} or "
                 f"ci.datasource={dsname}"
             ),

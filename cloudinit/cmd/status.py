@@ -4,7 +4,7 @@
 #
 # This file is part of cloud-init. See LICENSE file for license information.
 
-"""Define 'status' utility and handler as part of cloud-init commandline."""
+"""Define 'status' utility and handler as part of cloud-init command line."""
 
 import argparse
 import enum
@@ -12,7 +12,8 @@ import json
 import os
 import sys
 from copy import deepcopy
-from time import gmtime, sleep, strftime
+from datetime import datetime, timezone
+from time import sleep
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from cloudinit import safeyaml, subp
@@ -48,11 +49,11 @@ class EnabledStatus(enum.Enum):
     """Enum representing user-visible cloud-init boot status codes."""
 
     DISABLED_BY_GENERATOR = "disabled-by-generator"
-    DISABLED_BY_KERNEL_CMDLINE = "disabled-by-kernel-cmdline"
+    DISABLED_BY_KERNEL_CMDLINE = "disabled-by-kernel-command-line"
     DISABLED_BY_MARKER_FILE = "disabled-by-marker-file"
     DISABLED_BY_ENV_VARIABLE = "disabled-by-environment-variable"
     ENABLED_BY_GENERATOR = "enabled-by-generator"
-    ENABLED_BY_KERNEL_CMDLINE = "enabled-by-kernel-cmdline"
+    ENABLED_BY_KERNEL_CMDLINE = "enabled-by-kernel-command-line"
     ENABLED_BY_SYSVINIT = "enabled-by-sysvinit"
     UNKNOWN = "unknown"
 
@@ -76,7 +77,7 @@ class StatusDetails(NamedTuple):
     recoverable_errors: Dict[str, List[str]]
     last_update: str
     datasource: Optional[str]
-    v1: Dict[str, Dict]
+    v1: Dict[str, Any]
 
 
 TABULAR_LONG_TMPL = """\
@@ -179,7 +180,7 @@ def print_status(args, details: StatusDetails):
         **details.v1,
     }
     if args.format == "tabular":
-        prefix = "\n" if args.wait else ""
+        prefix = ""
 
         # For backwards compatibility, don't report degraded status here,
         # extended_status key reports the complete status (includes degraded)
@@ -318,8 +319,9 @@ def systemd_failed(wait: bool) -> bool:
     for service in [
         "cloud-final.service",
         "cloud-config.service",
-        "cloud-init.service",
+        "cloud-init-network.service",
         "cloud-init-local.service",
+        "cloud-init-main.service",
     ]:
         try:
             stdout = query_systemctl(
@@ -479,11 +481,11 @@ def get_status_details(
     description = get_description(status_v1, boot_description)
 
     latest_event = get_latest_event(status_v1)
-    last_update = (
-        strftime("%a, %d %b %Y %H:%M:%S %z", gmtime(latest_event))
-        if latest_event
-        else ""
-    )
+    if latest_event:
+        dt = datetime.fromtimestamp(latest_event, tz=timezone.utc)
+        last_update = dt.strftime("%a, %d %b %Y %H:%M:%S %z")
+    else:
+        last_update = ""
 
     errors, recoverable_errors = get_errors(status_v1)
     if errors:

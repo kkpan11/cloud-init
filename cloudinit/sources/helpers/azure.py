@@ -1,21 +1,24 @@
 # This file is part of cloud-init. See LICENSE file for license information.
+
+# TODO: Importing this file without first importing
+# cloudinit.sources.azure.errors will result in a circular import.
 import base64
+import binascii
 import json
 import logging
 import os
-import re
 import textwrap
 import zlib
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from time import sleep, time
 from typing import Callable, List, Optional, TypeVar, Union
-from xml.etree import ElementTree  # nosec B405
+from xml.etree import ElementTree as ET  # nosec B405
 from xml.sax.saxutils import escape  # nosec B406
 
 from cloudinit import distros, subp, temp_utils, url_helper, util, version
 from cloudinit.reporting import events
-from cloudinit.sources.azure import errors
+from cloudinit.sources.azure import certs, errors
 
 LOG = logging.getLogger(__name__)
 
@@ -119,9 +122,11 @@ def get_boot_telemetry():
         "boot-telemetry",
         "kernel_start=%s user_start=%s cloudinit_activation=%s"
         % (
-            datetime.utcfromtimestamp(kernel_start).isoformat() + "Z",
-            datetime.utcfromtimestamp(user_start).isoformat() + "Z",
-            datetime.utcfromtimestamp(cloudinit_activation).isoformat() + "Z",
+            datetime.fromtimestamp(kernel_start, timezone.utc).isoformat(),
+            datetime.fromtimestamp(user_start, timezone.utc).isoformat(),
+            datetime.fromtimestamp(
+                cloudinit_activation, timezone.utc
+            ).isoformat(),
         ),
         events.DEFAULT_EVENT_ORIGIN,
     )
@@ -227,7 +232,7 @@ def http_with_retries(
     *,
     headers: dict,
     data: Optional[bytes] = None,
-    retry_sleep: int = 5,
+    retry_sleep: int = 1,
     timeout_minutes: int = 20,
 ) -> url_helper.UrlResponse:
     """Readurl wrapper for querying wireserver.
@@ -277,10 +282,28 @@ def http_with_retries(
 
 
 def build_minimal_ovf(
-    username: str, hostname: str, disableSshPwd: str
+    *,
+    username: Optional[str],
+    hostname: Optional[str],
+    disable_ssh_password_auth: Optional[bool],
 ) -> bytes:
-    OVF_ENV_TEMPLATE = textwrap.dedent(
-        """\
+    if username:
+        ns_username = f"<ns1:UserName>{username}</ns1:UserName>"
+    else:
+        ns_username = ""
+
+    if disable_ssh_password_auth is None:
+        ns_disable_ssh_password_auth = ""
+    else:
+        ns_disable_ssh_password_auth = (
+            "<ns1:DisableSshPasswordAuthentication>"
+            f"{str(disable_ssh_password_auth).lower()}"
+            "</ns1:DisableSshPasswordAuthentication>"
+        )
+
+    ns_hostname = f"<ns1:HostName>{hostname}</ns1:HostName>"
+
+    return textwrap.dedent(f"""\
         <ns0:Environment xmlns:ns0="http://schemas.dmtf.org/ovf/environment/1"
          xmlns:ns1="http://schemas.microsoft.com/windowsazure"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -289,10 +312,9 @@ def build_minimal_ovf(
             <ns1:LinuxProvisioningConfigurationSet>
               <ns1:ConfigurationSetType>LinuxProvisioningConfiguration
               </ns1:ConfigurationSetType>
-              <ns1:UserName>{username}</ns1:UserName>
-              <ns1:DisableSshPasswordAuthentication>{disableSshPwd}
-              </ns1:DisableSshPasswordAuthentication>
-              <ns1:HostName>{hostname}</ns1:HostName>
+              {ns_username}
+              {ns_disable_ssh_password_auth}
+              {ns_hostname}
             </ns1:LinuxProvisioningConfigurationSet>
           </ns1:ProvisioningSection>
           <ns1:PlatformSettingsSection>
@@ -302,12 +324,7 @@ def build_minimal_ovf(
             </ns1:PlatformSettings>
           </ns1:PlatformSettingsSection>
         </ns0:Environment>
-        """
-    )
-    ret = OVF_ENV_TEMPLATE.format(
-        username=username, hostname=hostname, disableSshPwd=disableSshPwd
-    )
-    return ret.encode("utf-8")
+        """).encode("utf-8")
 
 
 class AzureEndpointHttpClient:
@@ -360,8 +377,8 @@ class GoalState:
         self.azure_endpoint_client = azure_endpoint_client
 
         try:
-            self.root = ElementTree.fromstring(unparsed_xml)  # nosec B314
-        except ElementTree.ParseError as e:
+            self.root = ET.fromstring(unparsed_xml)  # nosec B314
+        except ET.ParseError as e:
             report_diagnostic_event(
                 "Failed to parse GoalState XML: %s" % e,
                 logger_func=LOG.warning,
@@ -446,7 +463,7 @@ class OpenSSLManager:
                     "-days",
                     "32768",
                     "-newkey",
-                    "rsa:2048",
+                    "rsa:3072",
                     "-keyout",
                     self.certificate_names["private_key"],
                     "-out",
@@ -454,7 +471,9 @@ class OpenSSLManager:
                 ]
             )
             certificate = ""
-            for line in open(self.certificate_names["certificate"]):
+            for line in util.load_text_file(
+                self.certificate_names["certificate"]
+            ).splitlines():
                 if "CERTIFICATE" not in line:
                     certificate += line.rstrip()
             self.certificate = certificate
@@ -469,14 +488,11 @@ class OpenSSLManager:
 
     @azure_ds_telemetry_reporter
     def _get_ssh_key_from_cert(self, certificate):
-        pub_key = self._run_x509_action("-pubkey", certificate)
-        keygen_cmd = ["ssh-keygen", "-i", "-m", "PKCS8", "-f", "/dev/stdin"]
-        ssh_key, _ = subp.subp(keygen_cmd, data=pub_key)
-        return ssh_key
+        return certs.convert_x509_to_openssh(certificate)
 
     @azure_ds_telemetry_reporter
     def _get_fingerprint_from_cert(self, certificate):
-        """openssl x509 formats fingerprints as so:
+        r"""openssl x509 formats fingerprints as so:
         'SHA1 Fingerprint=07:3E:19:D1:4D:1C:79:92:24:C6:A0:FD:8D:DA:\
         B6:A8:BF:27:D4:73\n'
 
@@ -493,9 +509,7 @@ class OpenSSLManager:
         """Decrypt the certificates XML document using the our private key;
         return the list of certs and private keys contained in the doc.
         """
-        tag = ElementTree.fromstring(certificates_xml).find(  # nosec B314
-            ".//Data"
-        )
+        tag = ET.fromstring(certificates_xml).find(".//Data")  # nosec B314
         certificates_content = tag.text
         lines = [
             b"MIME-Version: 1.0",
@@ -520,25 +534,18 @@ class OpenSSLManager:
         """Given the Certificates XML document, return a dictionary of
         fingerprints and associated SSH keys derived from the certs."""
         out = self._decrypt_certs_from_xml(certificates_xml)
-        current = []
         keys = {}
-        for line in out.splitlines():
-            current.append(line)
-            if re.match(r"[-]+END .*?KEY[-]+$", line):
-                # ignore private_keys
-                current = []
-            elif re.match(r"[-]+END .*?CERTIFICATE[-]+$", line):
-                certificate = "\n".join(current)
-                ssh_key = self._get_ssh_key_from_cert(certificate)
-                fingerprint = self._get_fingerprint_from_cert(certificate)
-                keys[fingerprint] = ssh_key
-                current = []
+
+        for certificate in certs.extract_x509_certificates(out):
+            ssh_key = self._get_ssh_key_from_cert(certificate)
+            fingerprint = self._get_fingerprint_from_cert(certificate)
+            keys[fingerprint] = ssh_key
+
         return keys
 
 
 class GoalStateHealthReporter:
-    HEALTH_REPORT_XML_TEMPLATE = textwrap.dedent(
-        """\
+    HEALTH_REPORT_XML_TEMPLATE = textwrap.dedent("""\
         <?xml version="1.0" encoding="utf-8"?>
         <Health xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xmlns:xsd="http://www.w3.org/2001/XMLSchema">
@@ -556,17 +563,14 @@ class GoalStateHealthReporter:
             </RoleInstanceList>
           </Container>
         </Health>
-        """
-    )
+        """)
 
-    HEALTH_DETAIL_SUBSECTION_XML_TEMPLATE = textwrap.dedent(
-        """\
+    HEALTH_DETAIL_SUBSECTION_XML_TEMPLATE = textwrap.dedent("""\
         <Details>
           <SubStatus>{health_substatus}</SubStatus>
           <Description>{health_description}</Description>
         </Details>
-        """
-    )
+        """)
 
     PROVISIONING_SUCCESS_STATUS = "Ready"
     PROVISIONING_NOT_READY_STATUS = "NotReady"
@@ -940,21 +944,22 @@ def get_metadata_from_fabric(
 
 
 @azure_ds_telemetry_reporter
-def report_failure_to_fabric(endpoint: str, error: "errors.ReportableError"):
+def report_failure_to_fabric(endpoint: str, *, encoded_report: str):
     shim = WALinuxAgentShim(endpoint=endpoint)
-    description = error.as_encoded_report()
     try:
-        shim.register_with_azure_and_report_failure(description=description)
+        shim.register_with_azure_and_report_failure(description=encoded_report)
     finally:
         shim.clean_up()
 
 
-def dhcp_log_cb(out, err):
+def dhcp_log_cb(interface: str, out: str, err: str) -> None:
     report_diagnostic_event(
-        "dhclient output stream: %s" % out, logger_func=LOG.debug
+        f"dhcp client stdout for interface={interface}: {out}",
+        logger_func=LOG.debug,
     )
     report_diagnostic_event(
-        "dhclient error stream: %s" % err, logger_func=LOG.debug
+        f"dhcp client stderr for interface={interface}: {err}",
+        logger_func=LOG.debug,
     )
 
 
@@ -1003,12 +1008,12 @@ class OvfEnvXml:
                 unparsable or invalid.
         """
         try:
-            root = ElementTree.fromstring(ovf_env_xml)  # nosec B314
-        except ElementTree.ParseError as e:
+            root = ET.fromstring(ovf_env_xml)  # nosec B314
+        except ET.ParseError as e:
             raise errors.ReportableErrorOvfParsingException(exception=e) from e
 
         # If there's no provisioning section, it's not Azure ovf-env.xml.
-        if not root.find("./wa:ProvisioningSection", cls.NAMESPACES):
+        if root.find("./wa:ProvisioningSection", cls.NAMESPACES) is None:
             raise NonAzureDataSource(
                 "Ignoring non-Azure ovf-env.xml: ProvisioningSection not found"
             )
@@ -1029,7 +1034,7 @@ class OvfEnvXml:
         matches = node.findall(
             "./%s:%s" % (namespace, name), OvfEnvXml.NAMESPACES
         )
-        if len(matches) == 0:
+        if not matches:
             msg = "missing configuration for %r" % name
             LOG.debug(msg)
             if required:
@@ -1053,13 +1058,14 @@ class OvfEnvXml:
         default=None,
     ):
         matches = node.findall("./wa:" + name, OvfEnvXml.NAMESPACES)
-        if len(matches) == 0:
+        if not matches:
             msg = "missing configuration for %r" % name
             LOG.debug(msg)
             if required:
                 raise errors.ReportableErrorOvfInvalidMetadata(msg)
             return default
-        elif len(matches) > 1:
+
+        if len(matches) > 1:
             raise errors.ReportableErrorOvfInvalidMetadata(
                 "multiple configuration matches for %r (%d)"
                 % (name, len(matches))
@@ -1072,7 +1078,14 @@ class OvfEnvXml:
             value = default
 
         if decode_base64 and value is not None:
-            value = base64.b64decode("".join(value.split()))
+            try:
+                value = base64.b64decode(value)
+            except binascii.Error as error:
+                raise errors.ReportableErrorOvfInvalidBase64(
+                    field=name,
+                    error=error,
+                    length=len(value),
+                ) from error
 
         if parse_bool:
             value = util.translate_bool(value)
@@ -1096,11 +1109,18 @@ class OvfEnvXml:
             required=False,
         )
         self.username = self._parse_property(
-            config_set, "UserName", required=True
+            config_set, "UserName", required=False
         )
         self.password = self._parse_property(
             config_set, "UserPassword", required=False
         )
+        if (
+            self.password is not None
+            and len(self.password) > errors.MAX_PASSWORD_LENGTH
+        ):
+            raise errors.ReportableErrorOsProfilePasswordTooLong(
+                length=len(self.password)
+            )
         self.hostname = self._parse_property(
             config_set, "HostName", required=True
         )

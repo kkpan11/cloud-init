@@ -5,6 +5,7 @@
 Testing various config variations of the apt_source custom config
 This tries to call all in the new v3 format and cares about new features
 """
+
 import logging
 import os
 import pathlib
@@ -65,8 +66,8 @@ class TestAptSourceConfig:
 
     @staticmethod
     def _add_apt_sources(cfg, cloud, gpg, **kwargs):
-        with mock.patch.object(cc_apt_configure, "update_packages"):
-            cc_apt_configure.add_apt_sources(cfg, cloud, gpg, **kwargs)
+        # with mock.patch.object(cloud.distro, "update_package_sources"):
+        cc_apt_configure.add_apt_sources(cfg, cloud, gpg, **kwargs)
 
     @staticmethod
     def _get_default_params():
@@ -89,7 +90,7 @@ class TestAptSourceConfig:
 
         self._add_apt_sources(
             cfg,
-            cloud=None,
+            cloud=mock.Mock(),
             gpg=gpg,
             template_params=params,
             aa_repo_match=self.matcher,
@@ -185,7 +186,7 @@ class TestAptSourceConfig:
         params = self._get_default_params()
         self._add_apt_sources(
             cfg,
-            cloud=None,
+            cloud=mock.Mock(),
             gpg=gpg,
             template_params=params,
             aa_repo_match=self.matcher,
@@ -261,10 +262,11 @@ class TestAptSourceConfig:
         """
         params = self._get_default_params()
 
+        cloud = get_cloud()
         with mock.patch.object(cc_apt_configure, "add_apt_key") as mockobj:
             self._add_apt_sources(
                 cfg,
-                cloud=None,
+                cloud=cloud,
                 gpg=gpg,
                 template_params=params,
                 aa_repo_match=self.matcher,
@@ -274,9 +276,9 @@ class TestAptSourceConfig:
         calls = []
         for key in cfg:
             if is_hardened is not None:
-                calls.append(call(cfg[key], None, gpg, hardened=is_hardened))
+                calls.append(call(cfg[key], cloud, gpg, hardened=is_hardened))
             else:
-                calls.append(call(cfg[key], None, gpg))
+                calls.append(call(cfg[key], cloud, gpg))
 
         mockobj.assert_has_calls(calls, any_order=True)
 
@@ -389,7 +391,7 @@ class TestAptSourceConfig:
         mockobj = mocker.patch.object(cc_apt_configure, "apt_key")
         self._add_apt_sources(
             cfg,
-            cloud=None,
+            cloud=mock.Mock(),
             gpg=m_gpg,
             template_params=params,
             aa_repo_match=self.matcher,
@@ -427,7 +429,7 @@ class TestAptSourceConfig:
         mockobj = mocker.patch.object(cc_apt_configure, "apt_key")
         self._add_apt_sources(
             cfg,
-            cloud=None,
+            cloud=mock.Mock(),
             gpg=m_gpg,
             template_params=params,
             aa_repo_match=self.matcher,
@@ -458,7 +460,7 @@ class TestAptSourceConfig:
             with mock.patch.object(cc_apt_configure, "apt_key") as mockobj:
                 self._add_apt_sources(
                     cfg,
-                    cloud=None,
+                    cloud=mock.Mock(),
                     gpg=m_gpg,
                     template_params=params,
                     aa_repo_match=self.matcher,
@@ -494,7 +496,7 @@ class TestAptSourceConfig:
             ) as mockgetkey:
                 self._add_apt_sources(
                     cfg,
-                    cloud=None,
+                    cloud=mock.Mock(),
                     gpg=gpg,
                     template_params=params,
                     aa_repo_match=self.matcher,
@@ -559,7 +561,7 @@ class TestAptSourceConfig:
         with mock.patch.object(cc_apt_configure, "add_apt_key_raw") as mockadd:
             self._add_apt_sources(
                 cfg,
-                cloud=None,
+                cloud=mock.Mock(),
                 gpg=m_gpg,
                 template_params=params,
                 aa_repo_match=self.matcher,
@@ -584,7 +586,7 @@ class TestAptSourceConfig:
         with mock.patch("cloudinit.subp.subp") as mockobj:
             self._add_apt_sources(
                 cfg,
-                cloud=None,
+                cloud=mock.Mock(),
                 gpg=m_gpg,
                 template_params=params,
                 aa_repo_match=self.matcher,
@@ -614,7 +616,7 @@ class TestAptSourceConfig:
         with mock.patch("cloudinit.subp.subp") as mockobj:
             self._add_apt_sources(
                 cfg,
-                cloud=None,
+                cloud=mock.Mock(),
                 gpg=m_gpg,
                 template_params=params,
                 aa_repo_match=self.matcher,
@@ -926,20 +928,32 @@ class TestAptSourceConfig:
         # former tests can leave this set (or not if the test is ran directly)
         # do a hard reset to ensure a stable result
         util._DNS_REDIRECT_IP = None
+        badnames = (
+            "does-not-exist.example.com.",
+            "example.invalid.",
+            "__cloud_init_expected_not_found__",
+        )
         bad = [(None, None, None, "badname", ["10.3.2.1"])]
         good = [(None, None, None, "goodname", ["10.2.3.4"])]
         with mock.patch.object(
-            socket, "getaddrinfo", side_effect=[bad, bad, bad, good, good]
+            socket, "getaddrinfo", side_effect=[good, bad, bad, bad]
         ) as mocksock:
             ret = util.is_resolvable_url("http://us.archive.ubuntu.com/ubuntu")
-            ret2 = util.is_resolvable_url("http://1.2.3.4/ubuntu")
-        mocksock.assert_any_call(
-            "does-not-exist.example.com.", None, 0, 0, 1, 2
-        )
-        mocksock.assert_any_call("example.invalid.", None, 0, 0, 1, 2)
+        for badname in badnames:
+            mocksock.assert_any_call(badname, None, 0, 0, 1, 2)
         mocksock.assert_any_call("us.archive.ubuntu.com", None)
-
         assert ret is True
+
+        # IP addresses skip DNS checks entirely
+        with mock.patch.object(socket, "getaddrinfo") as mocksock:
+            ret2 = util.is_resolvable_url("http://1.2.3.4/ubuntu")
+            mocksock.assert_not_called()
+            # Verify badnames were NOT checked for IP addresses
+            for badname in badnames:
+                assert (
+                    mock.call(badname, None, 0, 0, 1, 2)
+                    not in mocksock.call_args_list
+                )
         assert ret2 is True
 
         # side effect need only bad ret after initial call
@@ -951,6 +965,15 @@ class TestAptSourceConfig:
         mocksock.assert_has_calls(calls)
         assert ret3 is False
 
+        # Test unresolvable hostname
+        with mock.patch.object(
+            socket, "getaddrinfo", side_effect=[bad]
+        ) as mocksock:
+            ret4 = util.is_resolvable_url("http://instance.:3336")
+        calls = [call("instance.", None)]
+        mocksock.assert_has_calls(calls)
+        assert ret4 is False
+
     def test_apt_v3_disable_suites(self):
         """test_disable_suites - disable_suites with many configurations"""
         release = "xenial"
@@ -961,7 +984,7 @@ deb-src http://ubuntu.com//ubuntu universe multiverse
 deb http://ubuntu.com/ubuntu/ xenial-proposed main"""
 
         # disable nothing
-        disabled = []
+        disabled: list = []
         expect = """deb http://ubuntu.com//ubuntu xenial main
 deb http://ubuntu.com//ubuntu xenial-updates main
 deb http://ubuntu.com//ubuntu xenial-security main
@@ -1596,9 +1619,11 @@ class TestIsDeb822SourcesFormat:
                 "#Something neither deb/deb-src nor deb822\n",
                 False,
                 [
-                    "apt.sources_list value does not match either deb822"
-                    " source keys or deb/deb-src list keys. Assuming APT"
-                    " deb/deb-src list format."
+                    (
+                        "apt.sources_list value does not match either deb822"
+                        " source keys or deb/deb-src list keys. Assuming APT"
+                        " deb/deb-src list format."
+                    )
                 ],
                 id="neither_deb822_keys_nor_deb_deb_src_warn_and_not_deb822",
             ),

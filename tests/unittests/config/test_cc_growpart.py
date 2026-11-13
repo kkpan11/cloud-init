@@ -7,14 +7,13 @@ import os
 import re
 import shutil
 import stat
-import unittest
 from contextlib import ExitStack
 from itertools import chain
 from unittest import mock
 
 import pytest
 
-from cloudinit import cloud, subp, temp_utils
+from cloudinit import cloud, distros, subp, temp_utils
 from cloudinit.config import cc_growpart
 from cloudinit.config.schema import (
     SchemaValidationError,
@@ -24,7 +23,6 @@ from cloudinit.config.schema import (
 from cloudinit.distros.bsd import BSD
 from cloudinit.subp import SubpResult
 from tests.unittests.helpers import (
-    TestCase,
     does_not_raise,
     skipUnlessJsonSchema,
 )
@@ -101,101 +99,95 @@ class Scanner:
         pass
 
 
-class TestDisabled(unittest.TestCase):
-    def setUp(self):
-        super(TestDisabled, self).setUp()
-        self.name = "growpart"
-        self.cloud = None
-        self.args = []
+def test_mode_off(mocker):
+    # Test that nothing is done if mode is off.
 
-        self.handle = cc_growpart.handle
+    # this really only verifies that resizer_factory isn't called
+    config = {"growpart": {"mode": "off"}}
 
-    def test_mode_off(self):
-        # Test that nothing is done if mode is off.
+    mock_resizer = mocker.patch.object(cc_growpart, "resizer_factory")
 
-        # this really only verifies that resizer_factory isn't called
-        config = {"growpart": {"mode": "off"}}
-
-        with mock.patch.object(cc_growpart, "resizer_factory") as mockobj:
-            self.handle(self.name, config, self.cloud, self.args)
-            self.assertEqual(mockobj.call_count, 0)
+    cc_growpart.handle(
+        name="growpart",
+        cfg=config,
+        cloud=None,
+        args=[],
+    )
+    mock_resizer.assert_not_called()
 
 
-class TestConfig(TestCase):
-    def setUp(self):
-        super(TestConfig, self).setUp()
-        self.name = "growpart"
-        self.paths = None
-        self.distro = mock.Mock()
-        self.cloud = cloud.Cloud(None, self.paths, None, self.distro, None)
-        self.log = logging.getLogger("TestConfig")
-        self.args = []
+@pytest.fixture
+def freebsd_cloud(mocker):
+    # Patch networking call during distro init
+    mocker.patch(
+        "cloudinit.distros.networking.subp.subp",
+        return_value=("", None),
+    )
+    cls = distros.fetch("freebsd")
+    distro = cls("freebsd", {}, None)
 
-        self.handle = cc_growpart.handle
-        self.tmppath = "/tmp/cloudinit-test-file"
-        self.tmpdir = os.scandir("/tmp")
-        self.tmpfile = open(self.tmppath, "w")
+    cloud_obj = cloud.Cloud(
+        None,
+        None,
+        {},
+        distro,
+        None,
+    )
+    return cloud_obj
 
-    def tearDown(self):
-        self.tmpfile.close()
-        os.remove(self.tmppath)
-        super().tearDown()
 
-    @mock.patch.object(os.path, "isfile", return_value=False)
-    def test_no_resizers_auto_is_fine(self, m_isfile):
-        with mock.patch.object(
+class TestConfig:
+    name = "growpart"
+    log = logging.getLogger("TestConfig")
+    args: list[str] = []
+
+    def test_no_resizers_auto_is_fine(self, freebsd_cloud, mocker):
+        mocker.patch.object(os.path, "isfile", return_value=False)
+
+        mock_subp = mocker.patch.object(
             subp, "subp", return_value=SubpResult(HELP_GROWPART_NO_RESIZE, "")
-        ) as mockobj:
-            config = {"growpart": {"mode": "auto"}}
-            self.handle(self.name, config, self.cloud, self.args)
+        )
+        config = {"growpart": {"mode": "auto"}}
+        cc_growpart.handle(self.name, config, freebsd_cloud, self.args)
 
-            mockobj.assert_has_calls(
-                [
-                    mock.call(
-                        ["growpart", "--help"], update_env={"LANG": "C"}
-                    ),
-                    mock.call(
-                        ["gpart", "help"], update_env={"LANG": "C"}, rcs=[0, 1]
-                    ),
-                ]
-            )
+        mock_subp.assert_has_calls(
+            [
+                mocker.call(["growpart", "--help"], update_env={"LANG": "C"}),
+                mocker.call(
+                    ["gpart", "help"], update_env={"LANG": "C"}, rcs=[0, 1]
+                ),
+            ]
+        )
 
-    def test_no_resizers_mode_growpart_is_exception(self):
+    def test_no_resizers_mode_growpart_is_exception(self, freebsd_cloud):
         with mock.patch.object(
             subp, "subp", return_value=SubpResult(HELP_GROWPART_NO_RESIZE, "")
         ) as mockobj:
             config = {"growpart": {"mode": "growpart"}}
-            self.assertRaises(
-                ValueError,
-                self.handle,
-                self.name,
-                config,
-                self.cloud,
-                self.args,
-            )
+            with pytest.raises(ValueError):
+                cc_growpart.handle(self.name, config, freebsd_cloud, self.args)
 
             mockobj.assert_called_once_with(
                 ["growpart", "--help"], update_env={"LANG": "C"}
             )
 
-    def test_mode_auto_prefers_growpart(self):
-        with mock.patch.object(
+    def test_mode_auto_prefers_growpart(self, mocker):
+        mock_subp = mocker.patch.object(
             subp, "subp", return_value=SubpResult(HELP_GROWPART_RESIZE, "")
-        ) as mockobj:
-            ret = cc_growpart.resizer_factory(
-                mode="auto", distro=mock.Mock(), devices=["/"]
-            )
-            self.assertIsInstance(ret, cc_growpart.ResizeGrowPart)
+        )
+        ret = cc_growpart.resizer_factory(
+            mode="auto", distro=mock.Mock(), devices=["/"]
+        )
+        assert isinstance(ret, cc_growpart.ResizeGrowPart)
 
-            mockobj.assert_called_once_with(
-                ["growpart", "--help"], update_env={"LANG": "C"}
-            )
+        mock_subp.assert_called_once_with(
+            ["growpart", "--help"], update_env={"LANG": "C"}
+        )
 
     @mock.patch.object(temp_utils, "mkdtemp", return_value="/tmp/much-random")
     @mock.patch.object(stat, "S_ISDIR", return_value=False)
     @mock.patch.object(os.path, "samestat", return_value=True)
     @mock.patch.object(os.path, "join", return_value="/tmp")
-    @mock.patch.object(os, "scandir", return_value=Scanner())
     @mock.patch.object(os, "mkdir")
     @mock.patch.object(os, "unlink")
     @mock.patch.object(os, "rmdir")
@@ -211,11 +203,11 @@ class TestConfig(TestCase):
             ret = cc_growpart.resizer_factory(
                 mode="auto", distro=mock.Mock(), devices=["/"]
             )
-            self.assertIsInstance(ret, cc_growpart.ResizeGrowPart)
+            assert isinstance(ret, cc_growpart.ResizeGrowPart)
             diskdev = "/dev/sdb"
             partnum = 1
             partdev = "/dev/sdb"
-            ret.resize(diskdev, partnum, partdev)
+            ret.resize(diskdev, partnum, partdev, None)
         mockobj.assert_has_calls(
             [
                 mock.call(
@@ -229,63 +221,57 @@ class TestConfig(TestCase):
             ]
         )
 
-    @mock.patch.object(os.path, "isfile", return_value=True)
-    def test_mode_use_growfs_on_root(self, m_isfile):
-        with mock.patch.object(
+    def test_mode_use_growfs_on_root(self, mocker):
+        mocker.patch.object(os.path, "isfile", return_value=True)
+        mock_subp = mocker.patch.object(
             subp, "subp", return_value=SubpResult("File not found", "")
-        ) as mockobj:
-            ret = cc_growpart.resizer_factory(
-                mode="auto", distro=mock.Mock(), devices=["/"]
-            )
-            self.assertIsInstance(ret, cc_growpart.ResizeGrowFS)
+        )
+        ret = cc_growpart.resizer_factory(
+            mode="auto", distro=mock.Mock(), devices=["/"]
+        )
+        assert isinstance(ret, cc_growpart.ResizeGrowFS)
 
-            mockobj.assert_has_calls(
-                [
-                    mock.call(
-                        ["growpart", "--help"], update_env={"LANG": "C"}
-                    ),
-                ]
-            )
+        mock_subp.assert_has_calls(
+            [
+                mocker.call(["growpart", "--help"], update_env={"LANG": "C"}),
+            ]
+        )
 
-    def test_mode_auto_falls_back_to_gpart(self):
-        with mock.patch.object(
+    def test_mode_auto_falls_back_to_gpart(self, mocker):
+        mock_subp = mocker.patch.object(
             subp, "subp", return_value=SubpResult("", HELP_GPART)
-        ) as mockobj:
-            ret = cc_growpart.resizer_factory(
-                mode="auto", distro=mock.Mock(), devices=["/", "/opt"]
-            )
-            self.assertIsInstance(ret, cc_growpart.ResizeGpart)
+        )
+        ret = cc_growpart.resizer_factory(
+            mode="auto", distro=mock.Mock(), devices=["/", "/opt"]
+        )
+        assert isinstance(ret, cc_growpart.ResizeGpart)
 
-            mockobj.assert_has_calls(
-                [
-                    mock.call(
-                        ["growpart", "--help"], update_env={"LANG": "C"}
-                    ),
-                    mock.call(
-                        ["gpart", "help"], update_env={"LANG": "C"}, rcs=[0, 1]
-                    ),
-                ]
-            )
+        mock_subp.assert_has_calls(
+            [
+                mocker.call(["growpart", "--help"], update_env={"LANG": "C"}),
+                mocker.call(
+                    ["gpart", "help"], update_env={"LANG": "C"}, rcs=[0, 1]
+                ),
+            ]
+        )
 
-    @mock.patch.object(os.path, "isfile", return_value=True)
-    def test_mode_auto_falls_back_to_growfs(self, m_isfile):
-        with mock.patch.object(
+    def test_mode_auto_falls_back_to_growfs(self, mocker):
+        mocker.patch.object(os.path, "isfile", return_value=True)
+        mock_subp = mocker.patch.object(
             subp, "subp", return_value=SubpResult("", HELP_GPART)
-        ) as mockobj:
-            ret = cc_growpart.resizer_factory(
-                mode="auto", distro=mock.Mock(), devices=["/"]
-            )
-            self.assertIsInstance(ret, cc_growpart.ResizeGrowFS)
+        )
+        ret = cc_growpart.resizer_factory(
+            mode="auto", distro=mock.Mock(), devices=["/"]
+        )
+        assert isinstance(ret, cc_growpart.ResizeGrowFS)
 
-            mockobj.assert_has_calls(
-                [
-                    mock.call(
-                        ["growpart", "--help"], update_env={"LANG": "C"}
-                    ),
-                ]
-            )
+        mock_subp.assert_has_calls(
+            [
+                mocker.call(["growpart", "--help"], update_env={"LANG": "C"}),
+            ]
+        )
 
-    def test_handle_with_no_growpart_entry(self):
+    def test_handle_with_no_growpart_entry(self, freebsd_cloud):
         # if no 'growpart' entry in config, then mode=auto should be used
 
         myresizer = object()
@@ -314,26 +300,25 @@ class TestConfig(TestCase):
                 )
             )
 
-            self.handle(self.name, {}, self.cloud, self.args)
+            cc_growpart.handle(self.name, {}, freebsd_cloud, self.args)
 
             factory.assert_called_once_with(
-                "auto", distro=self.distro, devices=["/"]
+                "auto", distro=freebsd_cloud.distro, devices=["/"]
             )
-            rsdevs.assert_called_once_with(myresizer, ["/"], self.distro)
+            rsdevs.assert_called_once_with(
+                myresizer, ["/"], freebsd_cloud.distro
+            )
 
 
-class TestResize(unittest.TestCase):
-    def setUp(self):
-        super().setUp()
-        self.name = "growpart"
-        self.distro = MockDistro()
-        self.log = logging.getLogger("TestResize")
-
-    def test_simple_devices(self):
+class TestResize:
+    def test_simple_devices(self, mocker):
         # test simple device list
         # this patches out devent2dev, os.stat, and device_part_info
         # so in the end, doesn't test a lot
+        distro = MockDistro()
         devs = ["/dev/XXda1", "/dev/YYda2"]
+        enoent = ["/dev/ZZda3"]
+
         devstat_ret = Bunch(
             st_mode=25008,
             st_ino=6078,
@@ -346,13 +331,11 @@ class TestResize(unittest.TestCase):
             st_mtime=0,
             st_ctime=0,
         )
-        enoent = ["/dev/NOENT"]
-        real_stat = os.stat
         resize_calls = []
 
         class myresizer:
-            def resize(self, diskdev, partnum, partdev):
-                resize_calls.append((diskdev, partnum, partdev))
+            def resize(self, diskdev, partnum, partdev, fs):
+                resize_calls.append((diskdev, partnum, partdev, fs))
                 if partdev == "/dev/YYda2":
                     return (1024, 2048)
                 return (1024, 1024)  # old size, new size
@@ -364,38 +347,102 @@ class TestResize(unittest.TestCase):
                 e = OSError("%s: does not exist" % path)
                 e.errno = errno.ENOENT
                 raise e
-            return real_stat(path)
+            raise AssertionError(f"unexpected stat call for {path}")
 
-        opinfo = self.distro.device_part_info
-        try:
-            self.distro.device_part_info = simple_device_part_info
-            os.stat = mystat
+        mocker.patch.object(
+            distro,
+            "device_part_info",
+            side_effect=simple_device_part_info,
+        )
+        mocker.patch("os.stat", side_effect=mystat)
+        resized = cc_growpart.resize_devices(
+            myresizer(), devs + enoent, distro
+        )
 
-            resized = cc_growpart.resize_devices(
-                myresizer(), devs + enoent, self.distro
+        def find(name, res):
+            for entry in res:
+                if entry[0] == name:
+                    return entry
+            return None
+
+        assert cc_growpart.RESIZE.NOCHANGE == find("/dev/XXda1", resized)[1]
+        assert cc_growpart.RESIZE.CHANGED == find("/dev/YYda2", resized)[1]
+        assert cc_growpart.RESIZE.SKIPPED == find(enoent[0], resized)[1]
+
+
+class TestResizeZFS:
+    def _devent2dev_side_effect(self, value):
+        if value.startswith("zroot"):
+            return value, "zfs"
+        raise RuntimeError(f"unexpected value {value}")
+
+    def _subp_side_effect(self, value, **kwargs):
+        if value[0] == "growpart":
+            raise subp.ProcessExecutionError()
+        elif value[0] == "zpool":
+            return ("1024\n", "")
+        raise subp.ProcessExecutionError()
+
+    @pytest.fixture
+    def common_mocks(self, mocker):
+        # These are all "happy path" mocks which will get overridden
+        # when needed
+        mocker.patch(
+            "cloudinit.config.cc_growpart.devent2dev",
+            side_effect=self._devent2dev_side_effect,
+        )
+        mocker.patch("cloudinit.util.is_container", return_value=False)
+        # Find /etc/rc.d/growfs
+        mocker.patch("os.path.isfile", return_value=True)
+        mocker.patch(
+            "cloudinit.config.cc_growpart.subp.subp",
+            side_effect=self._subp_side_effect,
+        )
+        cls = distros.fetch("freebsd")
+        # patch ifconfig -a
+        mocker.patch(
+            "cloudinit.distros.networking.subp.subp", return_value=("", None)
+        )
+        self.distro = cls("freebsd", {}, None)
+        # The fixture must yield to guarantee fixture lifcycle semantics,
+        # and to ensure pytest reliably executes the fixture before each test.
+        yield
+
+    @pytest.mark.parametrize(
+        "dev, expected",
+        [
+            ("zroot/ROOT/changed", cc_growpart.RESIZE.CHANGED),
+            ("zroot/ROOT/nochange", cc_growpart.RESIZE.NOCHANGE),
+        ],
+    )
+    def test_zroot(self, dev, expected, common_mocks):
+        resize_calls = []
+
+        class MyResizer(cc_growpart.ResizeGrowFS):
+            def resize(self, diskdev, partnum, partdev, fs):
+                resize_calls.append((diskdev, partnum, partdev, fs))
+                if partdev == "zroot/ROOT/changed":
+                    return (1024, 2048)
+                return (1024, 1024)  # old size, new size
+
+        def get_status_from_device(device_name, resize_results):
+            for result in resize_results:
+                if result[0] == device_name:
+                    return result[1]
+            raise ValueError(
+                f"Device {device_name} not found in {resize_results}"
             )
 
-            def find(name, res):
-                for f in res:
-                    if f[0] == name:
-                        return f
-                return None
-
-            self.assertEqual(
-                cc_growpart.RESIZE.NOCHANGE, find("/dev/XXda1", resized)[1]
-            )
-            self.assertEqual(
-                cc_growpart.RESIZE.CHANGED, find("/dev/YYda2", resized)[1]
-            )
-            self.assertEqual(
-                cc_growpart.RESIZE.SKIPPED, find(enoent[0], resized)[1]
-            )
-        finally:
-            self.distro.device_part_info = opinfo
-            os.stat = real_stat
+        resized = cc_growpart.resize_devices(
+            resizer=MyResizer(distro=self.distro),
+            devices=[dev],
+            distro=self.distro,
+        )
+        assert expected == get_status_from_device(dev, resized)
 
 
 class TestGetSize:
+    # TODO: add tests for get_zfs_size()
     @pytest.mark.parametrize(
         "file_exists, expected",
         (
@@ -408,7 +455,7 @@ class TestGetSize:
         tmp_file = tmp_path / "tmp.txt"
         if file_exists:
             tmp_file.write_bytes(b"0")
-        assert expected == cc_growpart.get_size(tmp_file)
+        assert expected == cc_growpart.get_size(tmp_file, None)
 
 
 class TestEncrypted:
@@ -437,11 +484,13 @@ class TestEncrypted:
 
     def _devent2dev_side_effect(self, value):
         if value == "/fake_encrypted":
-            return "/dev/mapper/fake"
+            return "/dev/mapper/fake", "ext3"
         elif value == "/":
-            return "/dev/vdz"
+            return "/dev/vdz", "ext4"
+        elif value.startswith("zroot"):
+            return value, "zfs"
         elif value.startswith("/dev"):
-            return value
+            return value, None
         raise RuntimeError(f"unexpected value {value}")
 
     def _realpath_side_effect(self, value):
@@ -467,7 +516,8 @@ class TestEncrypted:
     def common_mocks(self, mocker):
         # These are all "happy path" mocks which will get overridden
         # when needed
-        self.distro = MockDistro
+
+        self.distro = MockDistro()
         original_device_part_info = self.distro.device_part_info
         self.distro.device_part_info = self._device_part_info_side_effect
         mocker.patch("os.stat")
@@ -655,9 +705,13 @@ class TestEncrypted:
 
 def simple_device_part_info(devpath):
     # simple stupid return (/dev/vda, 1) for /dev/vda
-    ret = re.search("([^0-9]*)([0-9]*)$", devpath)
-    x = (ret.group(1), ret.group(2))
-    return x
+    match = re.search("([^0-9]*)([0-9]*)$", devpath)
+
+    # just some validation to check if the regex doesn't match.
+    # prevents AttributeError from None.group()
+    if not match:
+        raise ValueError(f"Invalid device path: {devpath}")
+    return match.group(1), match.group(2)
 
 
 class Bunch:
@@ -681,6 +735,12 @@ class TestDevicePartInfo:
                 does_not_raise(),
                 id="bsd_mbr_slice_and_partition",
             ),
+            pytest.param(
+                "zroot/ROOT/default",
+                (),
+                pytest.raises(ValueError),
+                id="zfs_dataset",
+            ),
         ),
     )
     def test_device_part_info(self, devpath, expected, raised_exception):
@@ -697,11 +757,12 @@ class TestGrowpartSchema:
                 {"growpart": {"mode": False}},
                 pytest.raises(
                     SchemaValidationError,
-                    match=(
+                    match=re.escape(
                         "Cloud config schema deprecations: "
                         "growpart.mode:  Changed in version 22.3. "
                         "Specifying a boolean ``false`` value for "
-                        "``mode`` is deprecated. Use ``off`` instead."
+                        "**mode** is deprecated. Use the string ``'off'`` "
+                        "instead."
                     ),
                 ),
             ),

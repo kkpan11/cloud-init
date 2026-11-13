@@ -103,6 +103,15 @@ below. It will log all messages of priority ``DEBUG`` or higher to both
 For additional information about configuring Python's logging module, please
 see the documentation for `python logging config`_.
 
+Security events
+===============
+
+Cloud-init writes security events as JSON Lines to
+:file:`/var/log/cloud-init-security.log`, with file permissions ``0600``.
+Each record minimally includes a timestamp, application ID, event type,
+severity, description, and hostname. Security events are separate from
+regular logging and console output.
+
 .. _logging_command_output:
 
 Command output
@@ -166,7 +175,7 @@ The default configuration is to emit events to the cloud-init log file
 at ``DEBUG`` level.
 
 Event reporting can be configured using the ``reporting`` key in cloud-config
-user data.
+user-data.
 
 Configuration
 -------------
@@ -271,7 +280,7 @@ With defaults used::
 
 
 For more information on ``rsyslog`` configuration, see
-:ref:`our module reference page<mod-rsyslog>`.
+:ref:`our module reference page <mod_cc_rsyslog>`.
 
 .. LINKS:
 .. _python logging config: https://docs.python.org/3/library/logging.config.html#configuration-file-format

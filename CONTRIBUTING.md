@@ -30,16 +30,16 @@ Before you can begin, you will need to:
 
 ## Getting help
 
-We use IRC and have a dedicated `#cloud-init` channel where you can contact
+We use Matrix and have a dedicated `#cloud-init` channel where you can contact
 us for help and guidance. This link will take you directly to our
-[IRC channel on Libera](https://kiwiirc.com/nextclient/irc.libera.chat/cloud-init).
+[Matrix room](https://matrix.to/#/%23cloud-init:ubuntu.com).
 Please don't be afraid to reach out if you need help constructing your pull
 request.
 
 ## Instructions for contributors
 
 The best way to get started is by checking out the
-["Development" section](https://cloudinit.readthedocs.io/en/latest/development/index.html)
+["Development" section](https://docs.cloud-init.io/en/latest/development/index.html)
 in our documentation. This covers everything; from how to find issues to work
 on, to how cloud-init is structured and useful resources, through to making your
 first PR and getting it accepted.

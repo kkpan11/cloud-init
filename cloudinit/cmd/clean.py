@@ -4,27 +4,31 @@
 #
 # This file is part of cloud-init. See LICENSE file for license information.
 
-"""Define 'clean' utility and handler as part of cloud-init commandline."""
+"""Define 'clean' utility and handler as part of cloud-init command line."""
 
 import argparse
 import glob
+import logging
 import os
+import stat
 import sys
 
-from cloudinit import settings
+from cloudinit import settings, sources
+from cloudinit.config import cc_mounts
 from cloudinit.distros import uses_systemd
+from cloudinit.log import log_util
 from cloudinit.net.netplan import CLOUDINIT_NETPLAN_FILE
 from cloudinit.stages import Init
 from cloudinit.subp import ProcessExecutionError, runparts, subp
 from cloudinit.util import (
     del_dir,
     del_file,
-    error,
     get_config_logfiles,
     is_link,
     write_file,
 )
 
+LOG = logging.getLogger(__name__)
 ETC_MACHINE_ID = "/etc/machine-id"
 GEN_NET_CONFIG_FILES = [
     CLOUDINIT_NETPLAN_FILE,
@@ -37,6 +41,23 @@ GEN_NET_CONFIG_FILES = [
 GEN_SSH_CONFIG_FILES = [
     "/etc/ssh/sshd_config.d/50-cloud-init.conf",
 ]
+
+
+def should_remove_log_file(log_file: str) -> bool:
+    """Check if a log file should be removed.
+
+    Avoid tracebacks from attempting to remove device files.
+
+    @param log_file: Path to the log file to check.
+    @returns: True if the file should be removed, False otherwise.
+    """
+    try:
+        file_stat = os.stat(log_file)
+        if stat.S_ISBLK(file_stat.st_mode) or stat.S_ISCHR(file_stat.st_mode):
+            return False
+    except OSError:
+        return False
+    return True
 
 
 def get_parser(parser=None):
@@ -69,8 +90,8 @@ def get_parser(parser=None):
         action="store_true",
         default=False,
         help=(
-            "Set /etc/machine-id to 'uninitialized\n' for golden image"
-            "creation. On next boot, systemd generates a new machine-id."
+            "Set /etc/machine-id to 'uninitialized\\n' for golden image"
+            " creation. On next boot, systemd generates a new machine-id."
             " Remove /etc/machine-id on non-systemd environments."
         ),
     )
@@ -96,6 +117,8 @@ def get_parser(parser=None):
             "all",
             "ssh_config",
             "network",
+            "datasource",
+            "fstab",
         ],
         default=[],
         nargs="+",
@@ -106,22 +129,23 @@ def get_parser(parser=None):
     return parser
 
 
-def remove_artifacts(remove_logs, remove_seed=False, remove_config=None):
+def remove_artifacts(init, remove_logs, remove_seed=False, remove_config=None):
     """Helper which removes artifacts dir and optionally log files.
 
+    @param: init: Init object to use
     @param: remove_logs: Boolean. Set True to delete the cloud_dir path. False
         preserves them.
     @param: remove_seed: Boolean. Set True to also delete seed subdir in
         paths.cloud_dir.
     @param: remove_config: List of strings.
-        Can be any of: all, network, ssh_config.
+        Can be any of: all, network, ssh_config, datasource, fstab.
     @returns: 0 on success, 1 otherwise.
     """
-    init = Init(ds_deps=[])
     init.read_cfg()
     if remove_logs:
         for log_file in get_config_logfiles(init.cfg):
-            del_file(log_file)
+            if should_remove_log_file(log_file):
+                del_file(log_file)
     if remove_config and set(remove_config).intersection(["all", "network"]):
         for path in GEN_NET_CONFIG_FILES:
             for conf in glob.glob(path):
@@ -131,9 +155,31 @@ def remove_artifacts(remove_logs, remove_seed=False, remove_config=None):
     ):
         for conf in GEN_SSH_CONFIG_FILES:
             del_file(conf)
+    if remove_config and set(remove_config).intersection(["all", "fstab"]):
+        cc_mounts.cleanup_fstab()
+
+    clean_datasource = remove_config and set(remove_config).intersection(
+        ["all", "datasource"]
+    )
 
     if not os.path.isdir(init.paths.cloud_dir):
+        log_util.multi_log(
+            "Artifacts already cleaned.",
+            log=LOG,
+            log_level=logging.INFO,
+        )
         return 0  # Artifacts dir already cleaned
+
+    if clean_datasource:
+        try:
+            init.fetch().clean()
+        except sources.DataSourceNotFoundException:
+            log_util.multi_log(
+                "No datasource found, nothing cleaned.",
+                log=LOG,
+                log_level=logging.INFO,
+            )
+
     seed_path = os.path.join(init.paths.cloud_dir, "seed")
     for path in glob.glob("%s/*" % init.paths.cloud_dir):
         if path == seed_path and not remove_seed:
@@ -144,12 +190,12 @@ def remove_artifacts(remove_logs, remove_seed=False, remove_config=None):
             else:
                 del_file(path)
         except OSError as e:
-            error("Could not remove {0}: {1}".format(path, str(e)))
+            log_util.error("Could not remove {0}: {1}".format(path, str(e)))
             return 1
     try:
         runparts(settings.CLEAN_RUNPARTS_DIR)
     except Exception as e:
-        error(
+        log_util.error(
             f"Failure during run-parts of {settings.CLEAN_RUNPARTS_DIR}: {e}"
         )
         return 1
@@ -158,8 +204,9 @@ def remove_artifacts(remove_logs, remove_seed=False, remove_config=None):
 
 def handle_clean_args(name, args):
     """Handle calls to 'cloud-init clean' as a subcommand."""
+    init = Init(ds_deps=[])
     exit_code = remove_artifacts(
-        args.remove_logs, args.remove_seed, args.remove_config
+        init, args.remove_logs, args.remove_seed, args.remove_config
     )
     if args.machine_id:
         if uses_systemd():
@@ -169,11 +216,13 @@ def handle_clean_args(name, args):
             # Non-systemd like FreeBSD regen machine-id when file is absent
             del_file(ETC_MACHINE_ID)
     if exit_code == 0 and args.reboot:
-        cmd = ["shutdown", "-r", "now"]
+        cmd = init.distro.shutdown_command(
+            mode="reboot", delay="now", message=""
+        )
         try:
             subp(cmd, capture=False)
         except ProcessExecutionError as e:
-            error(
+            log_util.error(
                 'Could not reboot this system using "{0}": {1}'.format(
                     cmd, str(e)
                 )

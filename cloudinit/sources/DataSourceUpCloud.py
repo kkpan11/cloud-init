@@ -60,7 +60,7 @@ class DataSourceUpCloud(sources.DataSource):
         )
 
     def _get_data(self):
-        (is_upcloud, server_uuid) = self._get_sysinfo()
+        is_upcloud, server_uuid = self._get_sysinfo()
 
         # only proceed if we know we are on UpCloud
         if not is_upcloud:
@@ -74,11 +74,7 @@ class DataSourceUpCloud(sources.DataSource):
                 nic = cloudnet.find_fallback_nic()
                 LOG.debug("Discovering metadata via DHCP interface %s", nic)
                 with EphemeralDHCPv4(self.distro, nic):
-                    md = util.log_time(
-                        logfunc=LOG.debug,
-                        msg="Reading from metadata service",
-                        func=self._read_metadata,
-                    )
+                    md = self._read_metadata()
             except (NoDHCPLeaseError, sources.InvalidMetaDataException) as e:
                 util.logexc(LOG, str(e))
                 return False
@@ -87,11 +83,7 @@ class DataSourceUpCloud(sources.DataSource):
                 LOG.debug(
                     "Discovering metadata without DHCP-configured networking"
                 )
-                md = util.log_time(
-                    logfunc=LOG.debug,
-                    msg="Reading from metadata service",
-                    func=self._read_metadata,
-                )
+                md = self._read_metadata()
             except sources.InvalidMetaDataException as e:
                 util.logexc(LOG, str(e))
                 LOG.info(
@@ -123,7 +115,7 @@ class DataSourceUpCloud(sources.DataSource):
         due to reconfiguration.
         """
 
-        if self._network_config:
+        if self._network_config and self._network_config != sources.UNSET:
             return self._network_config
 
         raw_network_config = self.metadata.get("network")

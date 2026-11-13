@@ -6,30 +6,30 @@
 
 import logging
 import os
-from textwrap import dedent
+from typing import Any, Dict
 
-from cloudinit import subp, util
+from cloudinit import lifecycle, subp, util
 from cloudinit.cloud import Cloud
 from cloudinit.config import Config
-from cloudinit.config.schema import MetaSchema, get_meta_doc
+from cloudinit.config.schema import MetaSchema
 from cloudinit.settings import PER_INSTANCE
 
 LOG = logging.getLogger(__name__)
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: Dict[str, Any] = {
     "ca_cert_path": None,
     "ca_cert_local_path": "/usr/local/share/ca-certificates/",
     "ca_cert_filename": "cloud-init-ca-cert-{cert_index}.crt",
     "ca_cert_config": "/etc/ca-certificates.conf",
     "ca_cert_update_cmd": ["update-ca-certificates"],
 }
-DISTRO_OVERRIDES = {
-    "fedora": {
-        "ca_cert_path": "/etc/pki/ca-trust/",
-        "ca_cert_local_path": "/usr/share/pki/ca-trust-source/",
-        "ca_cert_filename": "anchors/cloud-init-ca-cert-{cert_index}.crt",
-        "ca_cert_config": None,
-        "ca_cert_update_cmd": ["update-ca-trust"],
+DISTRO_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    "aosc": {
+        "ca_cert_path": "/etc/ssl/certs/",
+        "ca_cert_local_path": "/etc/ssl/certs/",
+        "ca_cert_filename": "cloud-init-ca-cert-{cert_index}.pem",
+        "ca_cert_config": "/etc/ca-certificates/conf.d/cloud-init.conf",
+        "ca_cert_update_cmd": ["update-ca-bundle"],
     },
     "rhel": {
         "ca_cert_path": "/etc/pki/ca-trust/",
@@ -54,71 +54,38 @@ DISTRO_OVERRIDES = {
     },
 }
 
-for distro in (
-    "opensuse-microos",
-    "opensuse-tumbleweed",
-    "opensuse-leap",
-    "sle_hpc",
-    "sle-micro",
-    "sles",
-):
-    DISTRO_OVERRIDES[distro] = DISTRO_OVERRIDES["opensuse"]
+DISTRO_FAMILY = {
+    "almalinux": "rhel",
+    "amazon": "rhel",
+    "centos": "rhel",
+    "cloudlinux": "rhel",
+    "fedora": "rhel",
+    "opensuse-microos": "opensuse",
+    "opensuse-tumbleweed": "opensuse",
+    "opensuse-leap": "opensuse",
+    "rocky": "rhel",
+    "sle_hpc": "opensuse",
+    "sle-micro": "opensuse",
+    "sles": "opensuse",
+}
 
-MODULE_DESCRIPTION = """\
-This module adds CA certificates to the system's CA store and updates any
-related files using the appropriate OS-specific utility. The default CA
-certificates can be disabled/deleted from use by the system with the
-configuration option ``remove_defaults``.
-
-.. note::
-    certificates must be specified using valid yaml. in order to specify a
-    multiline certificate, the yaml multiline list syntax must be used
-
-.. note::
-    Alpine Linux requires the ca-certificates package to be installed in
-    order to provide the ``update-ca-certificates`` command.
-"""
-distros = [
+distros = list(DISTRO_FAMILY.keys()) + [
+    "aosc",
     "alpine",
     "debian",
-    "fedora",
+    "raspberry-pi-os",
     "rhel",
     "opensuse",
-    "opensuse-microos",
-    "opensuse-tumbleweed",
-    "opensuse-leap",
-    "sle_hpc",
-    "sle-micro",
-    "sles",
     "ubuntu",
     "photon",
 ]
 
 meta: MetaSchema = {
     "id": "cc_ca_certs",
-    "name": "CA Certificates",
-    "title": "Add ca certificates",
-    "description": MODULE_DESCRIPTION,
     "distros": distros,
     "frequency": PER_INSTANCE,
-    "examples": [
-        dedent(
-            """\
-            ca_certs:
-              remove_defaults: true
-              trusted:
-                - single_line_cert
-                - |
-                  -----BEGIN CERTIFICATE-----
-                  YOUR-ORGS-TRUSTED-CA-CERT-HERE
-                  -----END CERTIFICATE-----
-            """
-        )
-    ],
     "activate_by_schema_keys": ["ca_certs", "ca-certs"],
 }
-
-__doc__ = get_meta_doc(meta)
 
 
 def _distro_ca_certs_configs(distro_name):
@@ -127,6 +94,8 @@ def _distro_ca_certs_configs(distro_name):
     @param distro_name: String providing the distro class name.
     @returns: Dict of distro configurations for ca_cert.
     """
+    if distro_name in DISTRO_FAMILY:
+        distro_name = DISTRO_FAMILY[distro_name]
     cfg = DISTRO_OVERRIDES.get(distro_name, DEFAULT_CONFIG)
     cfg["ca_cert_full_path"] = os.path.join(
         cfg["ca_cert_local_path"], cfg["ca_cert_filename"]
@@ -173,16 +142,22 @@ def disable_default_ca_certs(distro_name, distro_cfg):
     @param distro_name: String providing the distro class name.
     @param distro_cfg: A hash providing _distro_ca_certs_configs function.
     """
-    if distro_name in ["rhel", "photon"]:
+    if distro_name in ["rhel", "photon", "amazon"]:
         remove_default_ca_certs(distro_cfg)
-    elif distro_name in ["alpine", "debian", "ubuntu"]:
+    elif distro_name in [
+        "alpine",
+        "aosc",
+        "debian",
+        "raspberry-pi-os",
+        "ubuntu",
+    ]:
         disable_system_ca_certs(distro_cfg)
 
-        if distro_name in ["debian", "ubuntu"]:
+        if distro_name in ["debian", "raspberry-pi-os", "ubuntu"]:
             debconf_sel = (
                 "ca-certificates ca-certificates/trust_new_crts " + "select no"
             )
-            subp.subp(("debconf-set-selections", "-"), data=debconf_sel)
+            subp.subp(["debconf-set-selections", "-"], data=debconf_sel)
 
 
 def disable_system_ca_certs(distro_cfg):
@@ -249,7 +224,7 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
     @param args: Any module arguments from cloud.cfg
     """
     if "ca-certs" in cfg:
-        util.deprecate(
+        lifecycle.deprecate(
             deprecated="Key 'ca-certs'",
             deprecated_version="22.1",
             extra_message="Use 'ca_certs' instead.",
@@ -267,12 +242,14 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
             " Ignoring ca-certs."
         )
     ca_cert_cfg = cfg.get("ca_certs", cfg.get("ca-certs"))
+    if not isinstance(ca_cert_cfg, dict):
+        raise TypeError("unexpected type: {ca_cert_cfg}")
     distro_cfg = _distro_ca_certs_configs(cloud.distro.name)
 
     # If there is a remove_defaults option set to true, disable the system
     # default trusted CA certs first.
     if "remove-defaults" in ca_cert_cfg:
-        util.deprecate(
+        lifecycle.deprecate(
             deprecated="Key 'remove-defaults'",
             deprecated_version="22.1",
             extra_message="Use 'remove_defaults' instead.",

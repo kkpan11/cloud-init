@@ -31,7 +31,7 @@ def _old_mergedict(src, cand):
     Nested dictionaries are merged recursively.
     """
     if isinstance(src, dict) and isinstance(cand, dict):
-        for (k, v) in cand.items():
+        for k, v in cand.items():
             if k not in src:
                 src[k] = v
             else:
@@ -100,7 +100,7 @@ def make_dict(max_depth, seed=None):
     return _make_dict(0, max_depth, rand)
 
 
-class TestSimpleRun(helpers.ResourceUsingTestCase):
+class TestSimpleRun:
     def _load_merge_files(self):
         merge_root = helpers.resourceLocation("merge_sources")
         tests = []
@@ -138,17 +138,17 @@ class TestSimpleRun(helpers.ResourceUsingTestCase):
         for test in test_dicts:
             c = _old_mergemanydict(*test)
             d = util.mergemanydict(test)
-            self.assertEqual(c, d)
+            assert c == d
 
     def test_merge_cc_samples(self):
         tests = self._load_merge_files()
         paths = c_helpers.Paths({})
         cc_handler = cloud_config.CloudConfigPartHandler(paths)
         cc_handler.cloud_fn = None
-        for (payloads, (expected_merge, expected_fn)) in tests:
+        for payloads, (expected_merge, expected_fn) in tests:
             cc_handler.handle_part(None, CONTENT_START, None, None, None, None)
             merging_fns = []
-            for (fn, contents) in payloads:
+            for fn, contents in payloads:
                 cc_handler.handle_part(
                     None, None, "%s.yaml" % (fn), contents, None, {}
                 )
@@ -162,7 +162,7 @@ class TestSimpleRun(helpers.ResourceUsingTestCase):
                 merged_buf,
                 expected_merge,
             )
-            self.assertEqual(expected_merge, merged_buf, msg=fail_msg)
+            assert expected_merge == merged_buf, fail_msg
 
     def test_compat_merges_dict(self):
         a = {
@@ -174,7 +174,7 @@ class TestSimpleRun(helpers.ResourceUsingTestCase):
         }
         c = _old_mergedict(a, b)
         d = util.mergemanydict([a, b])
-        self.assertEqual(c, d)
+        assert c == d
 
     def test_compat_merges_dict2(self):
         a = {
@@ -189,7 +189,7 @@ class TestSimpleRun(helpers.ResourceUsingTestCase):
         }
         c = _old_mergedict(a, b)
         d = util.mergemanydict([a, b])
-        self.assertEqual(c, d)
+        assert c == d
 
     def test_compat_merges_list(self):
         a = {"b": [1, 2, 3]}
@@ -197,7 +197,7 @@ class TestSimpleRun(helpers.ResourceUsingTestCase):
         c = {"b": [6, 7]}
         e = _old_mergemanydict(a, b, c)
         f = util.mergemanydict([a, b, c])
-        self.assertEqual(e, f)
+        assert e == f
 
     def test_compat_merges_str(self):
         a = {"b": "hi"}
@@ -205,7 +205,7 @@ class TestSimpleRun(helpers.ResourceUsingTestCase):
         c = {"b": "hallo"}
         e = _old_mergemanydict(a, b, c)
         f = util.mergemanydict([a, b, c])
-        self.assertEqual(e, f)
+        assert e == f
 
     def test_compat_merge_sub_dict(self):
         a = {
@@ -229,7 +229,7 @@ class TestSimpleRun(helpers.ResourceUsingTestCase):
         }
         c = _old_mergedict(a, b)
         d = util.mergemanydict([a, b])
-        self.assertEqual(c, d)
+        assert c == d
 
     def test_compat_merge_sub_dict2(self):
         a = {
@@ -245,7 +245,7 @@ class TestSimpleRun(helpers.ResourceUsingTestCase):
         }
         c = _old_mergedict(a, b)
         d = util.mergemanydict([a, b])
-        self.assertEqual(c, d)
+        assert c == d
 
     def test_compat_merge_sub_list(self):
         a = {
@@ -261,7 +261,7 @@ class TestSimpleRun(helpers.ResourceUsingTestCase):
         }
         c = _old_mergedict(a, b)
         d = util.mergemanydict([a, b])
-        self.assertEqual(c, d)
+        assert c == d
 
 
 class TestMergingSchema:

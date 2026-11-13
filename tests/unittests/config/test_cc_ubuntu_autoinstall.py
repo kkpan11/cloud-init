@@ -24,45 +24,12 @@ Name                     Version                     Rev    Tracking      ...
 core20                   20220527                    1518   latest/stable ...
 lxd                      git-69dc707                 23315  latest/edge   ...
 """
-SAMPLE_SNAP_LIST_SUBIQUITY = (
-    SAMPLE_SNAP_LIST_OUTPUT
-    + """
+SAMPLE_SNAP_LIST_SUBIQUITY = SAMPLE_SNAP_LIST_OUTPUT + """
 subiquity                22.06.01                 23315  latest/stable   ...
 """
-)
-SAMPLE_SNAP_LIST_DESKTOP_INSTALLER = (
-    SAMPLE_SNAP_LIST_OUTPUT
-    + """
+SAMPLE_SNAP_LIST_DESKTOP_INSTALLER = SAMPLE_SNAP_LIST_OUTPUT + """
 ubuntu-desktop-installer 22.06.01                 23315  latest/stable   ...
 """
-)
-
-
-class TestvalidateConfigSchema:
-    @pytest.mark.parametrize(
-        "src_cfg,error_msg",
-        [
-            pytest.param(
-                {"autoinstall": 1},
-                "autoinstall: Expected dict type but found: int",
-                id="err_non_dict",
-            ),
-            pytest.param(
-                {"autoinstall": {}},
-                "autoinstall: Missing required 'version' key",
-                id="err_require_version_key",
-            ),
-            pytest.param(
-                {"autoinstall": {"version": "v1"}},
-                "autoinstall.version: Expected int type but found: str",
-                id="err_version_non_int",
-            ),
-        ],
-    )
-    def test_runtime_validation_errors(self, src_cfg, error_msg):
-        """cloud-init raises errors at runtime on invalid autoinstall config"""
-        with pytest.raises(SchemaValidationError, match=error_msg):
-            cc_ubuntu_autoinstall.validate_config_schema(src_cfg)
 
 
 @mock.patch(MODPATH + "util.wait_for_snap_seeded")
@@ -74,21 +41,15 @@ class TestHandleAutoinstall:
         "cfg,snap_list,subp_calls,logs,snap_wait_called",
         [
             pytest.param(
-                {},
-                SAMPLE_SNAP_LIST_OUTPUT,
-                [],
-                ["Skipping module named name, no 'autoinstall' key"],
-                False,
-                id="skip_no_cfg",
-            ),
-            pytest.param(
                 {"autoinstall": {"version": 1}},
                 SAMPLE_SNAP_LIST_OUTPUT,
                 [mock.call(["snap", "list"])],
                 [
-                    "Skipping autoinstall module. Expected one of the Ubuntu"
-                    " installer snap packages to be present: subiquity,"
-                    " ubuntu-desktop-installer"
+                    (
+                        "Skipping autoinstall module. Expected one of"
+                        " the Ubuntu installer snap packages to be present:"
+                        " subiquity, ubuntu-desktop-installer"
+                    )
                 ],
                 True,
                 id="valid_autoinstall_schema_checks_snaps",
@@ -98,8 +59,10 @@ class TestHandleAutoinstall:
                 SAMPLE_SNAP_LIST_SUBIQUITY,
                 [mock.call(["snap", "list"])],
                 [
-                    "Valid autoinstall schema. Config will be processed by"
-                    " subiquity"
+                    (
+                        "Valid autoinstall schema. Config will be processed by"
+                        " subiquity"
+                    )
                 ],
                 True,
                 id="valid_autoinstall_schema_sees_subiquity",
@@ -109,8 +72,10 @@ class TestHandleAutoinstall:
                 SAMPLE_SNAP_LIST_DESKTOP_INSTALLER,
                 [mock.call(["snap", "list"])],
                 [
-                    "Valid autoinstall schema. Config will be processed by"
-                    " ubuntu-desktop-installer"
+                    (
+                        "Valid autoinstall schema. Config will be processed by"
+                        " ubuntu-desktop-installer"
+                    )
                 ],
                 True,
                 id="valid_autoinstall_schema_sees_desktop_installer",
@@ -149,6 +114,8 @@ class TestAutoInstallSchema:
                 {"autoinstall": {}},
                 "autoinstall: 'version' is a required property",
             ),
+            ({"autoinstall": {"version": 1}}, None),
+            ({"autoinstall": {"version": "v1"}}, "is not of type 'integer'"),
         ),
     )
     @skipUnlessJsonSchema()

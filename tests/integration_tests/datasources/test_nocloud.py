@@ -1,23 +1,40 @@
 """NoCloud datasource integration tests."""
+
 from textwrap import dedent
 
 import pytest
 from pycloudlib.lxd.instance import LXDInstance
 
+from cloudinit import lifecycle
 from cloudinit.subp import subp
+from cloudinit.util import is_true
 from tests.integration_tests.instances import IntegrationInstance
 from tests.integration_tests.integration_settings import PLATFORM
 from tests.integration_tests.releases import CURRENT_RELEASE, FOCAL
 from tests.integration_tests.util import (
-    override_kernel_cmdline,
+    get_feature_flag_value,
+    network_wait_logged,
+    override_kernel_command_line,
     verify_clean_boot,
     verify_clean_log,
 )
 
 VENDOR_DATA = """\
 #cloud-config
-runcmd:
+bootcmd:
   - touch /var/tmp/seeded_vendordata_test_file
+"""
+
+# The fallback network config doesn't work on LXD, leading to
+# systemd-network-wait-online timing out and/or cloud-init raising
+# an error about wait-online.
+# This gives us a NoCloud default to work around these issues
+NETWORK_CONFIG = """\
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
 """
 
 
@@ -42,6 +59,12 @@ LXD_METADATA_NOCLOUD_SEED = """\
       default: |
         #cloud-config
         {}
+  /var/lib/cloud/seed/nocloud-net/network-config:
+    when:
+    - create
+    - copy
+    create_only: false
+    template: netcfg.tpl
 """
 
 
@@ -59,6 +82,13 @@ def setup_nocloud(instance: LXDInstance):
     subp(
         ["lxc", "config", "template", "edit", instance.name, "emptycfg.tpl"],
         data="#cloud-config\n{}\n",
+    )
+    subp(
+        ["lxc", "config", "template", "create", instance.name, "netcfg.tpl"],
+    )
+    subp(
+        ["lxc", "config", "template", "edit", instance.name, "netcfg.tpl"],
+        data=NETWORK_CONFIG,
     )
     subp(
         ["lxc", "config", "metadata", "edit", instance.name],
@@ -83,8 +113,11 @@ def test_nocloud_seedfrom_vendordata(client: IntegrationInstance):
         "mkdir {seed_dir} && "
         "touch {seed_dir}/user-data && "
         "touch {seed_dir}/meta-data && "
+        "echo '{net}' > {seed_dir}/network-config && "
         "echo 'seedfrom: {seed_dir}/' > "
-        "/var/lib/cloud/seed/nocloud-net/meta-data".format(seed_dir=seed_dir)
+        "/var/lib/cloud/seed/nocloud-net/meta-data".format(
+            seed_dir=seed_dir, net=NETWORK_CONFIG
+        )
     )
     assert result.return_code == 0
 
@@ -96,6 +129,9 @@ def test_nocloud_seedfrom_vendordata(client: IntegrationInstance):
     client.restart()
     assert client.execute("cloud-init status").ok
     assert "seeded_vendordata_test_file" in client.execute("ls /var/tmp")
+    assert network_wait_logged(
+        client.execute("cat /var/log/cloud-init.log")
+    ) == is_true(get_feature_flag_value(client, "MANUAL_NETWORK_WAIT"))
 
 
 SMBIOS_USERDATA = """\
@@ -113,8 +149,10 @@ def setup_nocloud_local_serial(instance: LXDInstance):
             "config",
             "set",
             instance.name,
-            "raw.qemu=-smbios "
-            f"type=1,serial=ds=nocloud;s=file://{SMBIOS_SEED_DIR};h=myhost",
+            (
+                "raw.qemu=-smbios "
+                f"type=1,serial=ds=nocloud;s=file://{SMBIOS_SEED_DIR};h=myhost"
+            ),
         ]
     )
 
@@ -126,8 +164,10 @@ def setup_nocloud_network_serial(instance: LXDInstance):
             "config",
             "set",
             instance.name,
-            "raw.qemu=-smbios "
-            "type=1,serial=ds=nocloud-net;s=http://0.0.0.0/;h=myhost",
+            (
+                "raw.qemu=-smbios "
+                "type=1,serial=ds=nocloud-net;s=http://0.0.0.0/;h=myhost"
+            ),
         ]
     )
 
@@ -159,7 +199,7 @@ class TestSmbios:
                 """\
                 [Unit]
                 Description=Serve a local webserver
-                Before=cloud-init.service
+                Before=cloud-init-network.service
                 Wants=cloud-init-local.service
                 DefaultDependencies=no
                 After=systemd-networkd-wait-online.service
@@ -192,9 +232,17 @@ class TestSmbios:
         assert client.execute("cloud-init clean --logs").ok
         client.restart()
         assert client.execute("test -f /var/tmp/smbios_test_file").ok
-        assert "'nocloud-net' datasource name is deprecated" in client.execute(
-            "cloud-init status --format json"
+        version_boundary = get_feature_flag_value(
+            client, "DEPRECATION_INFO_BOUNDARY"
         )
+        message = "The 'nocloud-net' datasource name is deprecated"
+        # nocloud-net deprecated in version 24.1
+        if lifecycle.should_log_deprecation("24.1", version_boundary):
+            verify_clean_boot(client, require_deprecations=[message])
+        else:
+            client.execute(
+                rf"grep \"INFO]: {message}\" /var/log/cloud-init.log"
+            ).ok
 
 
 @pytest.mark.skipif(PLATFORM != "lxd_vm", reason="Modifies grub config")
@@ -222,7 +270,7 @@ class TestFTP:
         """configure an ftp server to start prior to network timeframe
         optionally install certs and make the server support only FTP over TLS
 
-        cmdline: a string containing the kernel commandline set on reboot
+        cmdline: a string containing the kernel command line set on reboot
         client: an instance to configure
         encrypted: a boolean which modifies the configured ftp server
         """
@@ -255,6 +303,8 @@ class TestFTP:
                 #!/usr/bin/python3
                 import logging
 
+                from systemd.daemon import notify
+
                 from pyftpdlib.authorizers import DummyAuthorizer
                 from pyftpdlib.handlers import FTPHandler, TLS_FTPHandler
                 from pyftpdlib.servers import FTPServer
@@ -286,6 +336,9 @@ class TestFTP:
                 handler.abstracted_fs = UnixFilesystem
                 server = FTPServer(("localhost", 2121), handler)
 
+                # tell systemd to proceed
+                notify("READY=1")
+
                 # start the ftp server
                 server.serve_forever()
                 """
@@ -310,8 +363,12 @@ class TestFTP:
                 assert client.execute(
                     "git clone https://github.com/FiloSottile/mkcert && "
                     "cd mkcert && "
-                    "go build -ldflags "
-                    '"-X main.Version=$(git describe --tags)"'
+                    "export latest_ver=$(git describe --tags --abbrev=0) && "
+                    'curl -JL "https://github.com/FiloSottile/mkcert/releases/'
+                    "download/${latest_ver}/mkcert-"
+                    '${latest_ver}-linux-amd64"'
+                    " -o mkcert && "
+                    "chmod 755 mkcert"
                 ).ok
 
                 # giddyup
@@ -327,8 +384,7 @@ class TestFTP:
 
         client.write_to_file(
             "/lib/systemd/system/local-ftp.service",
-            dedent(
-                """\
+            dedent("""\
                 [Unit]
                 Description=TESTING USE ONLY ftp server
                 Wants=cloud-init-local.service
@@ -338,16 +394,16 @@ class TestFTP:
                 # and NoCloud operates in network timeframe
                 After=systemd-networkd-wait-online.service
                 After=networking.service
+                Before=cloud-init-network.service
                 Before=cloud-init.service
 
                 [Service]
-                Type=exec
+                Type=notify
                 ExecStart=/server.py
 
                 [Install]
                 WantedBy=cloud-init.target
-                """
-            ),
+                """),
         )
         assert client.execute(
             "chmod 644 /lib/systemd/system/local-ftp.service"
@@ -357,26 +413,22 @@ class TestFTP:
 
         client.write_to_file(
             "/user-data",
-            dedent(
-                """\
+            dedent("""\
                 #cloud-config
 
                 hostname: ftp-bootstrapper
-                """
-            ),
+                """),
         )
         client.write_to_file(
             "/meta-data",
-            dedent(
-                """\
+            dedent("""\
                 instance-id: ftp-instance
-                """
-            ),
+                """),
         )
         client.write_to_file("/vendor-data", "")
 
-        # set the kernel commandline, reboot with it
-        override_kernel_cmdline(cmdline, client)
+        # set the kernel command line, reboot with it
+        override_kernel_command_line(cmdline, client)
 
     def test_nocloud_ftp_unencrypted_server_succeeds(
         self, client: IntegrationInstance
@@ -405,12 +457,20 @@ class TestFTP:
             client,
             ignore_warnings=self.expected_warnings,
             require_warnings=[
-                "Getting data from <class 'cloudinit.sources.DataSourc"
-                "eNoCloud.DataSourceNoCloudNet'> failed",
+                (
+                    "Getting data from <class 'cloudinit.sources.DataSourc"
+                    "eNoCloud.DataSourceNoCloudNet'> failed"
+                ),
                 "Used fallback datasource",
-                "Attempted to connect to an insecure ftp server but used"
-                " a scheme of ftps://, which is not allowed. Use ftp:// "
-                "to allow connecting to insecure ftp servers.",
+                (
+                    "Attempted to connect to an insecure ftp server but used"
+                    " a scheme of ftps://, which is not allowed. Use ftp:// "
+                    "to allow connecting to insecure ftp servers."
+                ),
+            ],
+            ignore_tracebacks=[
+                'ftplib.error_perm: 500 Command "AUTH" not understood.',
+                "UrlError: Attempted to connect to an insecure ftp server",
             ],
         )
 

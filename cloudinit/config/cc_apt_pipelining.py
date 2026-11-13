@@ -7,18 +7,15 @@
 """Apt Pipelining: configure apt pipelining."""
 
 import logging
-from textwrap import dedent
 
-from cloudinit import util
+from cloudinit import lifecycle, util
 from cloudinit.cloud import Cloud
 from cloudinit.config import Config
-from cloudinit.config.schema import MetaSchema, get_meta_doc
+from cloudinit.config.schema import MetaSchema
 from cloudinit.settings import PER_INSTANCE
 
 LOG = logging.getLogger(__name__)
 
-frequency = PER_INSTANCE
-distros = ["ubuntu", "debian"]
 DEFAULT_FILE = "/etc/apt/apt.conf.d/90cloud-init-pipelining"
 APT_PIPE_TPL = (
     "//Written by cloud-init per 'apt_pipelining'\n"
@@ -31,35 +28,17 @@ APT_PIPE_TPL = (
 
 meta: MetaSchema = {
     "id": "cc_apt_pipelining",
-    "name": "Apt Pipelining",
-    "title": "Configure apt pipelining",
-    "description": dedent(
-        """\
-        This module configures apt's ``Acquite::http::Pipeline-Depth`` option,
-        which controls how apt handles HTTP pipelining. It may be useful for
-        pipelining to be disabled, because some web servers, such as S3 do not
-        pipeline properly (LP: #948461).
-
-        Value configuration options for this module are:
-
-        * ``os``: (Default) use distro default
-        * ``false`` disable pipelining altogether
-        * ``<number>``: Manually specify pipeline depth. This is not recommended."""  # noqa: E501
-    ),
-    "distros": distros,
-    "frequency": frequency,
-    "examples": [
-        "apt_pipelining: false",
-        "apt_pipelining: os",
-        "apt_pipelining: 3",
-    ],
+    "distros": ["ubuntu", "debian", "raspberry-pi-os"],
+    "frequency": PER_INSTANCE,
     "activate_by_schema_keys": ["apt_pipelining"],
 }
 
-__doc__ = get_meta_doc(meta)
-
 
 def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
+    lifecycle.deprecate(
+        deprecated="Module cc_apt_pipelining",
+        deprecated_version="26.3",
+    )
     apt_pipe_value = cfg.get("apt_pipelining", "os")
     apt_pipe_value_s = str(apt_pipe_value).lower().strip()
 

@@ -8,12 +8,14 @@
 
 import logging
 import os
+import re
 import stat
-from typing import Optional
+from datetime import datetime
+from typing import List, Optional, Tuple, Union
 
 from cloudinit import distros, helpers, subp, util
 from cloudinit.distros.parsers.hostname import HostnameConf
-from cloudinit.settings import PER_INSTANCE
+from cloudinit.settings import PER_ALWAYS, PER_INSTANCE
 
 LOG = logging.getLogger(__name__)
 
@@ -32,6 +34,7 @@ class Distro(distros.Distro):
     keymap_path = "/usr/share/bkeymaps/"
     locale_conf_fn = "/etc/profile.d/50-cloud-init-locale.sh"
     network_conf_fn = "/etc/network/interfaces"
+    shadow_fn = "/etc/shadow"
     renderer_configs = {
         "eni": {"eni_path": network_conf_fn, "eni_header": NETWORK_FILE_HEADER}
     }
@@ -40,7 +43,9 @@ class Distro(distros.Distro):
     dhclient_lease_directory = "/var/lib/dhcp"
     dhclient_lease_file_regex = r"dhclient\.leases"
 
-    def __init__(self, name, cfg, paths):
+    def __init__(
+        self, name: str, cfg: dict, paths: Optional[helpers.Paths]
+    ) -> None:
         distros.Distro.__init__(self, name, cfg, paths)
         # This will be used to restrict certain
         # calls from repeatedly happening (when they
@@ -50,13 +55,15 @@ class Distro(distros.Distro):
         self.osfamily = "alpine"
         cfg["ssh_svcname"] = "sshd"
 
-    def get_locale(self):
+    def get_locale(self) -> str:
         """The default locale for Alpine Linux is different than
         cloud-init's DataSource default.
         """
         return self.default_locale
 
-    def apply_locale(self, locale, out_fn=None):
+    def apply_locale(
+        self, locale: Optional[str], out_fn: Optional[str] = None
+    ) -> None:
         # Alpine has limited locale support due to musl library limitations
 
         if not locale:
@@ -75,11 +82,11 @@ class Distro(distros.Distro):
         ]
         util.write_file(out_fn, "\n".join(lines), 0o644)
 
-    def install_packages(self, pkglist: distros.PackageList):
+    def install_packages(self, pkglist: distros.PackageList) -> None:
         self.update_package_sources()
         self.package_command("add", pkgs=pkglist)
 
-    def _write_hostname(self, hostname, filename):
+    def _write_hostname(self, hostname: str, filename: str) -> None:
         conf = None
         try:
             # Try to update the previous one
@@ -101,16 +108,18 @@ class Distro(distros.Distro):
         conf.set_hostname(hostname)
         util.write_file(filename, str(conf), 0o644)
 
-    def _read_system_hostname(self):
+    def _read_system_hostname(self) -> Tuple[str, Optional[str]]:
         sys_hostname = self._read_hostname(self.hostname_conf_fn)
         return (self.hostname_conf_fn, sys_hostname)
 
-    def _read_hostname_conf(self, filename):
+    def _read_hostname_conf(self, filename: str) -> HostnameConf:
         conf = HostnameConf(util.load_text_file(filename))
         conf.parse()
         return conf
 
-    def _read_hostname(self, filename, default=None):
+    def _read_hostname(
+        self, filename: str, default: Optional[str] = None
+    ) -> Optional[str]:
         hostname = None
         try:
             conf = self._read_hostname_conf(filename)
@@ -121,10 +130,12 @@ class Distro(distros.Distro):
             return default
         return hostname
 
-    def _get_localhost_ip(self):
+    def _get_localhost_ip(self) -> str:
         return "127.0.1.1"
 
-    def set_keymap(self, layout: str, model: str, variant: str, options: str):
+    def set_keymap(
+        self, layout: str, model: str, variant: str, options: str
+    ) -> None:
         if not layout:
             msg = "Keyboard layout not specified."
             LOG.error(msg)
@@ -158,10 +169,15 @@ class Distro(distros.Distro):
 
         subp.subp(["setup-keymap", layout, variant])
 
-    def set_timezone(self, tz):
+    def set_timezone(self, tz: str) -> None:
         distros.set_etc_timezone(tz=tz, tz_file=self._find_tz_file(tz))
 
-    def package_command(self, command, args=None, pkgs=None):
+    def package_command(
+        self,
+        command: str,
+        args: Optional[Union[str, List[str]]] = None,
+        pkgs: Optional[distros.PackageList] = None,
+    ) -> None:
         if pkgs is None:
             pkgs = []
 
@@ -186,24 +202,339 @@ class Distro(distros.Distro):
         # Allow the output of this to flow outwards (ie not be captured)
         subp.subp(cmd, capture=False)
 
-    def update_package_sources(self):
+    def update_package_sources(self, *, force: bool = False) -> None:
         self._runner.run(
             "update-sources",
             self.package_command,
             ["update"],
-            freq=PER_INSTANCE,
+            freq=PER_ALWAYS if force else PER_INSTANCE,
         )
 
     @property
-    def preferred_ntp_clients(self):
+    def preferred_ntp_clients(self) -> List[str]:
         """Allow distro to determine the preferred ntp client list"""
         if not self._preferred_ntp_clients:
             self._preferred_ntp_clients = ["chrony", "ntp"]
 
         return self._preferred_ntp_clients
 
-    def shutdown_command(self, mode="poweroff", delay="now", message=None):
-        # called from cc_power_state_change.load_power_state
+    def _add_user(
+        self,
+        name: str,
+        *,
+        groups: List[str],
+        selinux_user: Optional[str] = None,
+        passwd: Optional[str] = None,
+        no_create_home: Optional[bool] = False,
+        system: Optional[bool] = False,
+        expiredate: Optional[str] = None,
+        inactive: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        if selinux_user:
+            LOG.warning("Ignoring selinux_user parameter for Alpine Linux")
+
+        # If 'useradd' is available (e.g. shadow package installed) use the
+        # generic GNU implementation.
+        if subp.which("useradd"):
+            super()._add_user(
+                name,
+                groups=groups,
+                passwd=passwd,
+                no_create_home=no_create_home,
+                system=system,
+                expiredate=expiredate,
+                inactive=inactive,
+                **kwargs,
+            )
+            return
+
+        adduser_cmd = ["adduser", "-D"]
+
+        # Since we are creating users, we want to carefully validate
+        # the inputs. If something goes wrong, we can end up with a
+        # system that nobody can login to.
+        adduser_opts = {
+            "gecos": "-g",
+            "homedir": "-h",
+            "primary_group": "-G",
+            "shell": "-s",
+            "uid": "-u",
+        }
+
+        for key, val in sorted(kwargs.items()):
+            if key in adduser_opts and val and isinstance(val, (str, int)):
+                adduser_cmd.extend([adduser_opts[key], str(val)])
+        if system:
+            adduser_cmd.append("-S")
+
+        # Don't create the home directory no_create_home is True or if the
+        # user is a system user.
+        if no_create_home or system:
+            adduser_cmd.append("-H")
+
+        # Busybox's 'adduser' puts username at end of command
+        adduser_cmd.append(name)
+
+        try:
+            subp.subp(adduser_cmd, logstring=adduser_cmd)
+        except subp.ProcessExecutionError:
+            LOG.warning("Failed to create user %s", name)
+            raise
+
+        # Separately add user to each additional group as Busybox's
+        # 'adduser' does not support specifying additional groups.
+        for addn_group in groups:
+            addn_group = addn_group.strip()
+            LOG.debug("Adding user to group %s", addn_group)
+            try:
+                subp.subp(["addgroup", name, addn_group])
+            except subp.ProcessExecutionError:
+                LOG.warning(
+                    "Failed to add user %s to group %s", name, addn_group
+                )
+                raise
+
+        if passwd:
+            # Separately set password as Busybox's 'adduser' does
+            # not support passing password as CLI option.
+            super().set_passwd(name, passwd, hashed=True)
+
+        # Busybox's 'adduser' is hardcoded to always set the following field
+        # values (numbered from "0") in /etc/shadow unlike 'useradd':
+        #
+        # Field                          Value set
+        #
+        #   3    minimum password age    0 (no min age)
+        #   4    maximum password age    99999 (days)
+        #   5    warning period          7 (warn days before max age)
+        #
+        # so modify these fields to be empty.
+        #
+        # Also set expiredate (field '7') and/or inactive (field '6')
+        # values directly in /etc/shadow file as Busybox's 'adduser'
+        # does not support passing these as CLI options.
+
+        shadow_file = self.shadow_fn
+        try:
+            shadow_contents = util.load_text_file(shadow_file)
+        except FileNotFoundError:
+            LOG.warning("Failed to read %s file, file not found", shadow_file)
+            raise
+
+        # Find the line in /etc/shadow for the user
+        original_line = None
+        for line in shadow_contents.splitlines():
+            new_line_parts = line.split(":")
+            if new_line_parts[0] == name:
+                original_line = line
+                break
+
+        if original_line:
+            # Modify field(s) in copy of user's shadow file entry
+            update_type = ""
+
+            # Minimum password age
+            new_line_parts[3] = ""
+            # Maximum password age
+            new_line_parts[4] = ""
+            # Password warning period
+            new_line_parts[5] = ""
+            update_type = "password aging"
+
+            if expiredate is not None:
+                # Convert date into number of days since 1st Jan 1970
+                days = (
+                    datetime.fromisoformat(expiredate)
+                    - datetime.fromisoformat("1970-01-01")
+                ).days
+                new_line_parts[7] = str(days)
+                if update_type != "":
+                    update_type = update_type + " & "
+                update_type = update_type + "acct expiration date"
+            if inactive is not None:
+                new_line_parts[6] = inactive
+                if update_type != "":
+                    update_type = update_type + " & "
+                update_type = update_type + "inactivity period"
+
+            # Replace existing line for user with modified line
+            shadow_contents = shadow_contents.replace(
+                original_line, ":".join(new_line_parts)
+            )
+            LOG.debug("Updating %s for user %s", update_type, name)
+            try:
+                util.write_file(
+                    shadow_file, shadow_contents, omode="w", preserve_mode=True
+                )
+            except IOError as e:
+                util.logexc(LOG, "Failed to update %s file", shadow_file)
+                raise e
+        else:
+            util.logexc(
+                LOG, "Failed to update %s for user %s", shadow_file, name
+            )
+
+    def lock_passwd(self, name: str) -> Optional[bool]:
+        """
+        Lock the password of a user, i.e., disable password logins
+        """
+
+        # Check whether Shadow's or Busybox's version of 'passwd'.
+        # If Shadow's 'passwd' is available then use the generic
+        # lock_passwd function from __init__.py instead.
+        if not os.path.islink(
+            "/usr/bin/passwd"
+        ) or "bbsuid" not in os.readlink("/usr/bin/passwd"):
+            return super().lock_passwd(name)
+
+        cmd = ["passwd", "-l", name]
+        # Busybox's 'passwd', unlike Shadow's 'passwd', errors
+        # if password is already locked:
+        #
+        #   "passwd: password for user2 is already locked"
+        #
+        # with exit code 1
+        try:
+            _out, err = subp.subp(cmd, rcs=[0, 1])
+            if re.search(r"is already locked", err):
+                return True
+        except subp.ProcessExecutionError as e:
+            util.logexc(LOG, "Failed to disable password for user %s", name)
+            raise e
+
+        return None
+
+    def unlock_passwd(self, name: str) -> Optional[bool]:
+        """
+        Unlock the password of a user, i.e., enable password logins
+        """
+
+        # Check whether Shadow's or Busybox's version of 'passwd'.
+        # If Shadow's 'passwd' is available then use the generic
+        # lock_passwd function from __init__.py instead.
+        if not os.path.islink(
+            "/usr/bin/passwd"
+        ) or "bbsuid" not in os.readlink("/usr/bin/passwd"):
+            return super().unlock_passwd(name)
+
+        cmd = ["passwd", "-u", name]
+        # Busybox's 'passwd', unlike Shadow's 'passwd', errors
+        # if password is already unlocked:
+        #
+        #   "passwd: password for user2 is already unlocked"
+        #
+        # with exit code 1
+        #
+        # and also does *not* error if no password is set.
+        try:
+            _, err = subp.subp(cmd, rcs=[0, 1])
+            if re.search(r"is already unlocked", err):
+                return True
+        except subp.ProcessExecutionError as e:
+            util.logexc(LOG, "Failed to unlock password for user %s", name)
+            raise e
+
+        return None
+
+    def expire_passwd(self, user: str) -> None:
+        # Check whether Shadow's or Busybox's version of 'passwd'.
+        # If Shadow's 'passwd' is available then use the generic
+        # expire_passwd function from __init__.py instead.
+        if not os.path.islink(
+            "/usr/bin/passwd"
+        ) or "bbsuid" not in os.readlink("/usr/bin/passwd"):
+            return super().expire_passwd(user)
+
+        # Busybox's 'passwd' does not provide an expire option
+        # so have to manipulate the shadow file directly.
+        shadow_contents = None
+        shadow_file = self.shadow_fn
+        try:
+            shadow_contents = util.load_text_file(shadow_file)
+        except FileNotFoundError as e:
+            LOG.warning("Failed to read %s file, file not found", shadow_file)
+            raise e
+
+        # Find the line in /etc/shadow for the user
+        original_line = None
+        for line in shadow_contents.splitlines():
+            new_line_parts = line.split(":")
+            if new_line_parts[0] == user:
+                LOG.debug("Found /etc/shadow line matching user %s", user)
+                original_line = line
+                break
+
+        if original_line:
+            # Replace existing line for user with modified line
+            #
+            # Field '2' (numbered from '0') in /etc/shadow
+            # is the "date of last password change".
+            if new_line_parts[2] != "0":
+                # Busybox's 'adduser' always expires password so only
+                # need to expire it now if this is not a new user.
+                new_line_parts[2] = "0"
+                shadow_contents = shadow_contents.replace(
+                    original_line, ":".join(new_line_parts), 1
+                )
+
+                LOG.debug("Expiring password for user %s", user)
+                try:
+                    util.write_file(
+                        shadow_file,
+                        shadow_contents,
+                        omode="w",
+                        preserve_mode=True,
+                    )
+                except IOError as e:
+                    util.logexc(LOG, "Failed to update %s file", shadow_file)
+                    raise e
+            else:
+                LOG.debug("Password for user %s is already expired", user)
+        else:
+            util.logexc(LOG, "Failed to set 'expire' for %s", user)
+
+    def create_group(
+        self, name: str, members: Optional[List[str]] = None
+    ) -> None:
+        # If 'groupadd' is available then use the generic
+        # create_group function from __init__.py instead.
+        if subp.which("groupadd"):
+            return super().create_group(name, members)
+
+        group_add_cmd = ["addgroup", name]
+        if not members:
+            members = []
+
+        # Check if group exists, and then add if it doesn't
+        if util.is_group(name):
+            LOG.warning("Skipping creation of existing group '%s'", name)
+        else:
+            try:
+                subp.subp(group_add_cmd)
+                LOG.info("Created new group %s", name)
+            except subp.ProcessExecutionError:
+                util.logexc(LOG, "Failed to create group %s", name)
+
+        # Add members to the group, if so defined
+        if len(members) > 0:
+            for member in members:
+                if not util.is_user(member):
+                    LOG.warning(
+                        "Unable to add group member '%s' to group '%s'"
+                        "; user does not exist.",
+                        member,
+                        name,
+                    )
+                    continue
+
+                subp.subp(["addgroup", member, name])
+                LOG.info("Added user '%s' to group '%s'", member, name)
+
+    @classmethod
+    def _build_shutdown_command(
+        cls, mode: str, delay: str, message: str
+    ) -> List[str]:
         # Alpine has halt/poweroff/reboot, with the following specifics:
         # - we use them rather than the generic "shutdown"
         # - delay is given with "-d [integer]"
@@ -218,18 +549,12 @@ class Distro(distros.Distro):
             # Alpine's commands do not understand "now".
             command += ["0"]
         else:
-            try:
-                command.append(str(int(delay) * 60))
-            except ValueError as e:
-                raise TypeError(
-                    "power_state[delay] must be 'now' or '+m' (minutes)."
-                    " found '%s'." % (delay,)
-                ) from e
+            command.append(str(int(delay) * 60))
 
         return command
 
     @staticmethod
-    def uses_systemd():
+    def uses_systemd() -> bool:
         """
         Alpine uses OpenRC, not systemd
         """
@@ -237,8 +562,12 @@ class Distro(distros.Distro):
 
     @classmethod
     def manage_service(
-        self, action: str, service: str, *extra_args: str, rcs=None
-    ):
+        cls,
+        action: str,
+        service: str,
+        *extra_args: str,
+        rcs: Optional[List[int]] = None,
+    ) -> subp.SubpResult:
         """
         Perform the requested action on a service. This handles OpenRC
         specific implementation details.

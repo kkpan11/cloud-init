@@ -4,7 +4,7 @@ import os
 import stat
 from functools import partial
 from textwrap import dedent
-from typing import NamedTuple
+from typing import Dict, NamedTuple
 from unittest import mock
 from unittest.mock import patch
 
@@ -314,6 +314,56 @@ class TestAuthKeyLineParser:
         else:
             assert key.comment == ""
 
+    @pytest.mark.parametrize("with_options", [True, False])
+    @pytest.mark.parametrize("with_comment", [True, False])
+    @pytest.mark.parametrize("options_parameter", [None, "", 'from="::1"'])
+    @pytest.mark.parametrize("ktype", ["rsa", "ed25519"])
+    def test_parse_with_options_parameter(
+        self, ktype, with_comment, with_options, options_parameter
+    ):
+        """Test options parameter behavior with different values.
+
+        This test specifically validates that the options parameter passed to
+        parse() correctly overrides or is overridden by options in the key
+        line.
+        It is very similar to test_parse() but only runs for 2 key types to
+        avoid having too many parameterized tests.
+        """
+        content = VALID_CONTENT[ktype]
+        comment = "user-%s@host" % ktype
+
+        line_args = []
+        if with_options:
+            line_args.append(TEST_OPTIONS)
+        line_args.extend(
+            [
+                ktype,
+                content,
+            ]
+        )
+        if with_comment:
+            line_args.append(comment)
+        line = " ".join(line_args)
+
+        key = ssh_util.AuthKeyLineParser().parse(
+            line, options=options_parameter
+        )
+
+        assert key.base64 == content
+        assert key.keytype == ktype
+        if options_parameter:
+            # When the options parameter is truthy, override options from line
+            assert key.options == options_parameter
+        elif with_options:
+            # When the options parameter is falsy and line has options,
+            # those are returned
+            assert key.options == TEST_OPTIONS
+        else:
+            # When the options parameter is falsy and the line has no options,
+            # the same falsy value is returned (e.g. None or "")
+            assert key.options == options_parameter
+        assert key.comment == (comment if with_comment else "")
+
     def test_parse_with_options_passed_in(self):
         # test key line with key type and base64 only
         parser = ssh_util.AuthKeyLineParser()
@@ -561,6 +611,18 @@ class TestUpdateSshConfig:
         expected_conf_file = f"{mycfg}.d/50-cloud-init.conf"
         assert not os.path.isfile(expected_conf_file)
 
+    def test_without_sshd_config(self, tmpdir):
+        """In some cases /etc/ssh/sshd_config.d exists but /etc/ssh/sshd_config
+        doesn't. In this case we shouldn't create /etc/ssh/sshd_config but make
+        /etc/ssh/sshd_config.d/50-cloud-init.conf."""
+        mycfg = tmpdir.join("sshd_config")
+        os.mkdir(os.path.join(tmpdir, "sshd_config.d"))
+        assert ssh_util.update_ssh_config({"key": "value"}, mycfg)
+        expected_conf_file = f"{mycfg}.d/50-cloud-init.conf"
+        assert os.path.isfile(expected_conf_file)
+        assert not os.path.isfile(mycfg)
+        assert "key value\n" == util.load_text_file(expected_conf_file)
+
     @pytest.mark.parametrize(
         "cfg",
         ["Include {mycfg}.d/*.conf", "Include {mycfg}.d/*.conf # comment"],
@@ -606,14 +668,12 @@ class TestAppendSshConfig:
             [("MyKey", "NEW_VAL"), ("MyKey", "NEW_VAL_2")], mycfg
         )
         found = util.load_text_file(mycfg)
-        expected_cfg = dedent(
-            """\
+        expected_cfg = dedent("""\
             #Option val
             MyKey ORIG_VAL
             MyKey NEW_VAL
             MyKey NEW_VAL_2
-            """
-        )
+            """)
         assert expected_cfg == found
         # assert there is a newline at end of file (LP: #1677205)
         assert "\n" == found[-1]
@@ -750,7 +810,7 @@ class TestMultipleSshAuthorizedKeysFile:
         return sshd_config
 
     def execute_and_check(self, user, sshd_config, solution, keys):
-        (auth_key_fn, auth_key_entries) = ssh_util.extract_authorized_keys(
+        auth_key_fn, auth_key_entries = ssh_util.extract_authorized_keys(
             user, sshd_config
         )
         content = ssh_util.update_authorized_keys(auth_key_entries, [])
@@ -777,8 +837,8 @@ class TestMultipleSshAuthorizedKeysFile:
         tmpdir,
     ):
         user_bobby = "bobby"
-        keys = {}
-        users = {}
+        keys: Dict[str, str] = {}
+        users: Dict[str, FakePwEnt] = {}
         mock_permissions = {
             tmpdir.join("home", "bobby"): ("bobby", "bobby", 0o700),
             tmpdir.join("home", "bobby", ".ssh"): ("bobby", "bobby", 0o700),
@@ -845,8 +905,8 @@ class TestMultipleSshAuthorizedKeysFile:
         tmpdir,
     ):
         user_bobby = "bobby"
-        keys = {}
-        users = {}
+        keys: Dict[str, str] = {}
+        users: Dict[str, FakePwEnt] = {}
         mock_permissions = {
             tmpdir.join("home", "bobby"): ("bobby", "bobby", 0o700),
             tmpdir.join("home", "bobby", ".ssh"): ("bobby", "bobby", 0o700),
@@ -908,8 +968,8 @@ class TestMultipleSshAuthorizedKeysFile:
         self, m_get_group, m_get_owner, m_get_permissions, m_getpwnam, tmpdir
     ):
         user_bobby = "bobby"
-        keys = {}
-        users = {}
+        keys: Dict[str, str] = {}
+        users: Dict[str, FakePwEnt] = {}
         mock_permissions = {
             tmpdir.join("home", "bobby"): ("bobby", "bobby", 0o700),
             tmpdir.join("home", "bobby", ".ssh"): ("bobby", "bobby", 0o700),
@@ -950,8 +1010,8 @@ class TestMultipleSshAuthorizedKeysFile:
     def test_two_users_local_file_standard(
         self, m_get_group, m_get_owner, m_get_permissions, m_getpwnam, tmpdir
     ):
-        keys = {}
-        users = {}
+        keys: Dict[str, str] = {}
+        users: Dict[str, FakePwEnt] = {}
         mock_permissions = {
             tmpdir.join("home", "bobby"): ("bobby", "bobby", 0o700),
             tmpdir.join("home", "bobby", ".ssh"): ("bobby", "bobby", 0o700),
@@ -1007,8 +1067,8 @@ class TestMultipleSshAuthorizedKeysFile:
     def test_two_users_local_file_custom(
         self, m_get_group, m_get_owner, m_get_permissions, m_getpwnam, tmpdir
     ):
-        keys = {}
-        users = {}
+        keys: Dict[str, str] = {}
+        users: Dict[str, FakePwEnt] = {}
         mock_permissions = {
             tmpdir.join("home", "bobby"): ("bobby", "bobby", 0o700),
             tmpdir.join("home", "bobby", ".ssh"): ("bobby", "bobby", 0o700),
@@ -1064,8 +1124,8 @@ class TestMultipleSshAuthorizedKeysFile:
     def test_two_users_local_global_files(
         self, m_get_group, m_get_owner, m_get_permissions, m_getpwnam, tmpdir
     ):
-        keys = {}
-        users = {}
+        keys: Dict[str, str] = {}
+        users: Dict[str, FakePwEnt] = {}
         mock_permissions = {
             tmpdir.join("home", "bobby"): ("bobby", "bobby", 0o700),
             tmpdir.join("home", "bobby", ".ssh"): ("bobby", "bobby", 0o700),
@@ -1150,8 +1210,8 @@ class TestMultipleSshAuthorizedKeysFile:
         m_get_user_groups,
         tmpdir,
     ):
-        keys = {}
-        users = {}
+        keys: Dict[str, str] = {}
+        users: Dict[str, FakePwEnt] = {}
         mock_permissions = {
             tmpdir.join("home", "bobby"): ("bobby", "bobby", 0o700),
             tmpdir.join("home", "bobby", ".ssh"): ("bobby", "bobby", 0o700),
@@ -1233,8 +1293,8 @@ class TestMultipleSshAuthorizedKeysFile:
         m_get_user_groups,
         tmpdir,
     ):
-        keys = {}
-        users = {}
+        keys: Dict[str, str] = {}
+        users: Dict[str, FakePwEnt] = {}
         mock_permissions = {
             tmpdir.join("home", "bobby"): ("bobby", "bobby", 0o700),
             tmpdir.join("home", "bobby", ".ssh"): ("bobby", "bobby", 0o700),
@@ -1326,8 +1386,8 @@ class TestMultipleSshAuthorizedKeysFile:
         m_get_user_groups,
         tmpdir,
     ):
-        keys = {}
-        users = {}
+        keys: Dict[str, str] = {}
+        users: Dict[str, FakePwEnt] = {}
         mock_permissions = {
             tmpdir.join("home", "bobby"): ("bobby", "bobby", 0o700),
             tmpdir.join("home", "bobby", ".ssh"): ("bobby", "bobby", 0o700),
@@ -1421,8 +1481,8 @@ class TestMultipleSshAuthorizedKeysFile:
         inverted,
         tmpdir,
     ):
-        keys = {}
-        users = {}
+        keys: Dict[str, str] = {}
+        users: Dict[str, FakePwEnt] = {}
         mock_permissions = {
             tmpdir.join("home", "bobby"): ("bobby", "bobby", 0o700),
             tmpdir.join("home", "bobby", ".ssh"): ("bobby", "bobby", 0o700),
@@ -1497,8 +1557,8 @@ class TestMultipleSshAuthorizedKeysFile:
         m_get_user_groups,
         tmpdir,
     ):
-        keys = {}
-        users = {}
+        keys: Dict[str, str] = {}
+        users: Dict[str, FakePwEnt] = {}
         mock_permissions = {
             tmpdir.join("home", "bobby"): ("bobby", "bobby", 0o700),
             tmpdir.join("home", "bobby", ".ssh"): ("bobby", "bobby", 0o700),

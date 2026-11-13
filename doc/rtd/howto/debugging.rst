@@ -53,9 +53,9 @@ Cloud-init did not run
 
 3. Check the status of the services
 
-   .. code-block::
+   .. code-block:: shell-session
 
-      systemctl status cloud-init-local.service cloud-init.service\
+      systemctl status cloud-init-local.service cloud-init-network.service\
          cloud-config.service cloud-final.service
 
    Cloud-init may have started to run, but not completed. This shows how many,
@@ -66,9 +66,9 @@ Cloud-init did not run
 Cloud-init ran, but didn't do what I want it to
 ===============================================
 
-1. If you are using cloud-init's user data
+1. If you are using cloud-init's user-data
    :ref:`cloud config<user_data_formats-cloud_config>`, make sure
-   to :ref:`validate your user data cloud config<check_user_data_cloud_config>`
+   to :ref:`validate your user-data cloud config<check_user_data_cloud_config>`
 
 2. Check for errors in ``cloud-init status --long``
 
@@ -108,7 +108,7 @@ system, or the result of a user configuration.
 External reasons
 ----------------
 
-- Failed dependent services in the boot.
+- Other services failed or are stuck.
 - Bugs in the kernel or drivers.
 - Bugs in external userspace tools that are called by ``cloud-init``.
 
@@ -124,13 +124,13 @@ To start debugging
 
 1. Check ``dmesg`` for errors:
 
-   .. code-block::
+   .. code-block:: shell-session
 
       dmesg -T | grep -i -e warning -e error -e fatal -e exception
 
 2. Investigate other systemd services that failed
 
-   .. code-block::
+   .. code-block:: shell-session
 
       systemctl --failed
 
@@ -142,22 +142,34 @@ To start debugging
    See :ref:`our guide on exported errors<reported_status>` for more
    information on these exported errors.
 
-4. Identify which cloud-init :ref:`boot stage<boot_stages>` is currently
-   running:
+4. Inspect running services :ref:`boot stage<boot_stages>`:
 
-   .. code-block::
+   .. code-block:: shell-session
 
-      systemctl status cloud-init-local.service cloud-init.service\
-           cloud-config.service cloud-final.service
+      $ systemctl list-jobs --after
+      JOB UNIT                                             TYPE  STATE
+      150 cloud-final.service                              start waiting
+      └─      waiting for job 147 (cloud-init.target/start)   -     -
+      155 blocking-daemon.service                               start running
+      └─      waiting for job 150 (cloud-final.service/start) -     -
+      147 cloud-init.target                                start waiting
 
-   Cloud-init may have started to run, but not completed. This shows how many,
-   and which, cloud-init stages completed.
+      3 jobs listed.
+
+
+   In the above example we can see that ``cloud-final.service`` is
+   waiting and is ordered before ``cloud-init.target``, and that
+   ``blocking-daemon.service`` is currently running and is ordered
+   before ``cloud-final.service``. From this output, we deduce that cloud-init
+   is not complete because the service named ``blocking-daemon.service`` hasn't
+   yet completed, and that we should investigate ``blocking-daemon.service``
+   to understand why it is still running.
 
 5. Use the PID of the running service to find all running subprocesses.
    Any running process that was spawned by cloud-init may be blocking
    cloud-init from continuing.
 
-   .. code-block::
+   .. code-block:: shell-session
 
       pstree <PID>
 

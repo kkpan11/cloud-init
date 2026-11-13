@@ -12,7 +12,14 @@ from inspect import signature
 from types import ModuleType
 from typing import Dict, List, NamedTuple, Optional
 
-from cloudinit import config, importer, type_utils, util
+from cloudinit import (
+    config,
+    importer,
+    lifecycle,
+    performance,
+    type_utils,
+    util,
+)
 from cloudinit.distros import ALL_DISTROS
 from cloudinit.helpers import ConfigMerger
 from cloudinit.reporting.events import ReportEventStack
@@ -31,6 +38,8 @@ MOD_PREFIX = "cc_"
 # from having to create upgrade scripts to avoid warnings about missing
 # modules.
 REMOVED_MODULES = [
+    "cc_emit_upstart",  # Removed in 22.2
+    "cc_refresh_rmc_and_interface.py",  # Removed in 23.2
     "cc_migrator",  # Removed in 24.1
     "cc_rightscale_userdata",  # Removed in 24.1
 ]
@@ -194,7 +203,7 @@ class Modules:
             if not mod_name:
                 continue
             if freq and freq not in FREQUENCIES:
-                util.deprecate(
+                lifecycle.deprecate(
                     deprecated=(
                         f"Config specified module {raw_name} has an unknown"
                         f" frequency {freq}"
@@ -205,10 +214,10 @@ class Modules:
                 # default meta attribute "frequency" value is used.
                 freq = None
             if mod_name in RENAMED_MODULES:
-                util.deprecate(
+                lifecycle.deprecate(
                     deprecated=(
                         f"Module has been renamed from {mod_name} to "
-                        f"{RENAMED_MODULES[mod_name][1]}. Update any"
+                        f"{RENAMED_MODULES[mod_name]}. Update any"
                         " references in /etc/cloud/cloud.cfg"
                     ),
                     deprecated_version="24.1",
@@ -278,16 +287,21 @@ class Modules:
                     func_signature = signature(mod.handle)
                     func_params = func_signature.parameters
                     if len(func_params) == 5:
-                        util.deprecate(
+                        lifecycle.deprecate(
                             deprecated="Config modules with a `log` parameter",
                             deprecated_version="23.2",
                         )
                         func_args.update({"log": LOG})
-                    ran, _r = cc.run(
-                        run_name, mod.handle, func_args, freq=freq
-                    )
+
+                    with performance.Timed("", log_mode="skip") as timer:
+                        ran, _r = cc.run(
+                            run_name, mod.handle, func_args, freq=freq
+                        )
                     if ran:
-                        myrep.message = "%s ran successfully" % run_name
+                        myrep.message = (
+                            f"{run_name} ran successfully and "
+                            f"took {timer.delta:.3f} seconds"
+                        )
                     else:
                         myrep.message = "%s previously ran" % run_name
 
@@ -325,11 +339,9 @@ class Modules:
         forced = []
         overridden = self.cfg.get("unverified_modules", [])
         inapplicable_mods = []
-        active_mods = []
+        active_mods: List[ModuleDetails] = []
         for module_details in mostly_mods:
-            (mod, name, _freq, _args) = module_details
-            if mod is None:
-                continue
+            mod, name, _freq, _args = module_details
             worked_distros = mod.meta["distros"]
             if not _is_active(module_details, self.cfg):
                 inapplicable_mods.append(name)
@@ -345,7 +357,7 @@ class Modules:
                         skipped.append(name)
                         continue
                     forced.append(name)
-            active_mods.append([mod, name, _freq, _args])
+            active_mods.append(ModuleDetails(mod, name, _freq, _args))
 
         if inapplicable_mods:
             LOG.info(

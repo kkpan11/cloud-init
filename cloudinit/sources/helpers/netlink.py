@@ -15,15 +15,11 @@ LOG = logging.getLogger(__name__)
 
 # http://man7.org/linux/man-pages/man7/netlink.7.html
 RTMGRP_LINK = 1
-NLMSG_NOOP = 1
-NLMSG_ERROR = 2
-NLMSG_DONE = 3
 RTM_NEWLINK = 16
 RTM_DELLINK = 17
 RTM_GETLINK = 18
 RTM_SETLINK = 19
 MAX_SIZE = 65535
-RTA_DATA_OFFSET = 32
 MSG_TYPE_OFFSET = 16
 SELECT_TIMEOUT = 60
 
@@ -72,7 +68,7 @@ def create_bound_netlink_socket():
             socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE
         )
         netlink_socket.bind((os.getpid(), RTMGRP_LINK))
-        netlink_socket.setblocking(0)
+        netlink_socket.setblocking(False)
     except socket.error as e:
         msg = "Exception during netlink socket create: %s" % e
         raise NetlinkCreateSocketError(msg) from e
@@ -117,7 +113,7 @@ def read_netlink_socket(netlink_socket, timeout=None):
     """
     assert netlink_socket is not None, "netlink socket is none"
     read_set, _, _ = select.select([netlink_socket], [], [], timeout)
-    # Incase of timeout,read_set doesn't contain netlink socket.
+    # In case of timeout,read_set doesn't contain netlink socket.
     # just return from this function
     if netlink_socket not in read_set:
         return None

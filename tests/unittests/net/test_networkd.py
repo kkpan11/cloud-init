@@ -10,6 +10,35 @@ import yaml
 from cloudinit import safeyaml
 from cloudinit.net import network_state, networkd
 
+V2_CONFIG_OPTIONAL = """\
+network:
+  version: 2
+  ethernets:
+    eth0:
+      optional: true
+    eth1:
+      optional: false
+"""
+
+V2_CONFIG_OPTIONAL_RENDERED_ETH0 = """[Link]
+RequiredForOnline=no
+
+[Match]
+Name=eth0
+
+[Network]
+DHCP=no
+
+"""
+
+V2_CONFIG_OPTIONAL_RENDERED_ETH1 = """[Match]
+Name=eth1
+
+[Network]
+DHCP=no
+
+"""
+
 V2_CONFIG_SET_NAME = """\
 network:
   version: 2
@@ -113,8 +142,7 @@ DNS=8.8.8.8 2001:4860:4860::8888
 
 """
 
-V2_CONFIG_DHCP_DOMAIN_VS_OVERRIDE = Template(
-    """\
+V2_CONFIG_DHCP_DOMAIN_VS_OVERRIDE = Template("""\
 network:
   version: 2
   ethernets:
@@ -123,11 +151,9 @@ network:
       dhcp${dhcp_version}: true
       dhcp${dhcp_version}-overrides:
         use-domains: route
-"""
-)
+""")
 
-V2_CONFIG_DHCP_OVERRIDES = Template(
-    """\
+V2_CONFIG_DHCP_OVERRIDES = Template("""\
 network:
   version: 2
   ethernets:
@@ -139,11 +165,9 @@ network:
         macaddress: "00:11:22:33:44:55"
       nameservers:
         addresses: ["8.8.8.8", "2001:4860:4860::8888"]
-"""
-)
+""")
 
-V2_CONFIG_DHCP_OVERRIDES_RENDERED = Template(
-    """[DHCPv${dhcp_version}]
+V2_CONFIG_DHCP_OVERRIDES_RENDERED = Template("""[DHCPv${dhcp_version}]
 ${key}=${value}
 
 [Match]
@@ -154,8 +178,7 @@ Name=eth0
 DHCP=ipv${dhcp_version}
 DNS=8.8.8.8 2001:4860:4860::8888
 
-"""
-)
+""")
 
 V1_CONFIG_MULTI_SUBNETS = """
 network:
@@ -451,6 +474,17 @@ class TestNetworkdRenderState:
         with mock.patch("cloudinit.net.network_state.get_interfaces_by_mac"):
             config = yaml.safe_load(config)
             return network_state.parse_net_config_data(config["network"])
+
+    def test_networkd_render_with_optional(self):
+        with mock.patch("cloudinit.net.get_interfaces_by_mac"):
+            ns = self._parse_network_state_from_config(V2_CONFIG_OPTIONAL)
+            renderer = networkd.Renderer()
+            rendered_content = renderer._render_content(ns)
+
+        assert "eth0" in rendered_content
+        assert rendered_content["eth0"] == V2_CONFIG_OPTIONAL_RENDERED_ETH0
+        assert "eth1" in rendered_content
+        assert rendered_content["eth1"] == V2_CONFIG_OPTIONAL_RENDERED_ETH1
 
     def test_networkd_render_with_set_name(self):
         with mock.patch("cloudinit.net.get_interfaces_by_mac"):

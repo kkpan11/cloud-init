@@ -3,18 +3,8 @@
 # Author: Aman Kumar Sinha <amansi26@in.ibm.com>
 #
 # This file is part of cloud-init. See LICENSE file for license information.
-"""Reset RMC: Reset rsct node id"""
-import logging
-import os
+"""Reset RMC: Reset rsct node id
 
-from cloudinit import subp, util
-from cloudinit.cloud import Cloud
-from cloudinit.config import Config
-from cloudinit.config.schema import MetaSchema
-from cloudinit.distros import ALL_DISTROS
-from cloudinit.settings import PER_INSTANCE
-
-MODULE_DESCRIPTION = """\
 Reset RMC module is IBM PowerVM Hypervisor specific
 
 Reliable Scalable Cluster Technology (RSCT) is a set of software components,
@@ -35,14 +25,20 @@ This module handles
 Prerequisite of using this module is to install RSCT packages.
 """
 
+import logging
+import os
+
+from cloudinit import lifecycle, subp, util
+from cloudinit.cloud import Cloud
+from cloudinit.config import Config
+from cloudinit.config.schema import MetaSchema
+from cloudinit.distros import ALL_DISTROS
+from cloudinit.settings import PER_INSTANCE
+
 meta: MetaSchema = {
     "id": "cc_reset_rmc",
-    "name": "Reset RMC",
-    "title": "reset rsct node id",
-    "description": MODULE_DESCRIPTION,
     "distros": [ALL_DISTROS],
     "frequency": PER_INSTANCE,
-    "examples": [],
     "activate_by_schema_keys": [],
 }
 
@@ -71,6 +67,11 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
     if not os.path.isdir(RSCT_PATH):
         LOG.debug("module disabled, RSCT_PATH not present")
         return
+
+    lifecycle.deprecate(
+        deprecated="Module cc_reset_rmc",
+        deprecated_version="26.3",
+    )
 
     orig_path = os.environ.get("PATH")
     try:
@@ -108,7 +109,7 @@ def get_node_id():
 
 def add_path(orig_path):
     # Adding the RSCT_PATH to env standard path
-    # So thet cloud init automatically find and
+    # So that cloud init automatically find and
     # run RECFGCT to create new node_id.
     suff = ":" + orig_path if orig_path else ""
     os.environ["PATH"] = RSCT_PATH + suff

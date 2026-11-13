@@ -1,10 +1,10 @@
 .. _merging_user_data:
 
-Merging user data sections
-**************************
+Merging cloud-config
+********************
 
-The ability to merge user data sections allows a way to specify how
-cloud-config YAML "dictionaries" provided as user data are handled when there
+The ability to merge cloud-config allows a way to specify how
+cloud-config YAML "dictionaries" provided as user-data are handled when there
 are multiple YAML files to be merged together (e.g., when performing an
 #include).
 
@@ -94,69 +94,13 @@ merging is done on other types.
 Customisation
 =============
 
-Because the above merging algorithm may not always be desired (just as the
-previous merging algorithm was not always the preferred one), the concept of
-customised merging was introduced through `merge classes`.
-
-A `merge class` is a class definition providing functions that can be used
-to merge a given type with another given type.
-
-An example of one of these `merging classes` is the following:
-
-.. code-block:: python
-
-   class Merger:
-       def __init__(self, merger, opts):
-           self._merger = merger
-           self._overwrite = 'overwrite' in opts
-
-       # This merging algorithm will attempt to merge with
-       # another dictionary, on encountering any other type of object
-       # it will not merge with said object, but will instead return
-       # the original value
-       #
-       # On encountering a dictionary, it will create a new dictionary
-       # composed of the original and the one to merge with, if 'overwrite'
-       # is enabled then keys that exist in the original will be overwritten
-       # by keys in the one to merge with (and associated values). Otherwise
-       # if not in overwrite mode the 2 conflicting keys themselves will
-       # be merged.
-       def _on_dict(self, value, merge_with):
-           if not isinstance(merge_with, (dict)):
-               return value
-           merged = dict(value)
-           for (k, v) in merge_with.items():
-               if k in merged:
-                   if not self._overwrite:
-                       merged[k] = self._merger.merge(merged[k], v)
-                   else:
-                       merged[k] = v
-               else:
-                   merged[k] = v
-           return merged
-
-As you can see, there is an ``_on_dict`` method here that will be given a
-source value, and a value to merge with. The result will be the merged object.
-
-This code itself is called by another merging class which "directs" the
-merging to happen by analysing the object types to merge, and attempting to
-find a known object that will merge that type. An example of this can be found
-in the :file:`mergers/__init__.py` file (see ``LookupMerger`` and
-``UnknownMerger``).
-
-So, following the typical ``cloud-init`` approach of allowing source code to
-be downloaded and used dynamically, it is possible for users to inject their
-own merging files to handle specific types of merging as they choose (the
-basic ones included will handle lists, dicts, and strings). Note how each
-merge can have options associated with it, which affect how the merging is
-performed. For example, a dictionary merger can be told to overwrite instead
-of attempting to merge, or a string merger can be told to append strings
-instead of discarding other strings to merge with.
+Custom 3rd party mergers can be defined, for more info visit
+:ref:`custom_mergers`.
 
 How to activate
 ===============
 
-There are a few ways to activate the merging algorithms, and to customise them
+There are a few ways to activate the merging algorithms, and to customize them
 for your own usage.
 
 1. The first way involves the usage of MIME messages in ``cloud-init`` to
@@ -222,15 +166,15 @@ merge with a cloud-config dictionary coming after it.
 Other uses
 ==========
 
-In addition to being used for merging user data sections, the default merging
+In addition to being used for merging user-data sections, the default merging
 algorithm for merging :file:`'conf.d'` YAML files (which form an initial YAML
 config for ``cloud-init``) was also changed to use this mechanism, to take
-advantage of the full benefits (and customisation) here as well. Other places
-that used the previous merging are also, similarly, now extensible (metadata
+advantage of the full benefits (and customization) here as well. Other places
+that used the previous merging are also, similarly, now extensible (meta-data
 merging, for example).
 
 Note, however, that merge algorithms are not used *across* configuration types.
-As was the case before merging was implemented, user data will overwrite
+As was the case before merging was implemented, user-data will overwrite
 :file:`'conf.d'` configuration without merging.
 
 Example cloud-config

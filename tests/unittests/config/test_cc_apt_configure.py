@@ -1,6 +1,6 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
-""" Tests for cc_apt_configure module """
+"""Tests for cc_apt_configure module"""
 
 import re
 from pathlib import Path
@@ -194,7 +194,7 @@ class TestAPTConfigureSchema:
         else:
             with pytest.raises(SchemaValidationError, match=error_msg):
                 validate_cloudconfig_schema(config, schema, strict=True)
-            # Note apt['primary'] and apt['security'] have same defition
+            # Note apt['primary'] and apt['security'] have same definition
             # Avoid test setup duplicates by running same test using 'security'
             if isinstance(config.get("apt"), dict) and config["apt"].get(
                 "primary"
@@ -272,6 +272,15 @@ class TestEnsureDependencies:
         else:
             install_packages.assert_not_called()
 
+    def test_none_aa_repo_match_skips_source_check(self, mocker):
+        """_ensure_dependencies must not call aa_repo_match when it is None."""
+        mycloud = get_cloud("debian")
+        mocker.patch.object(mycloud.distro, "install_packages")
+        cfg = {"sources": {"s1": {"source": "ppa:yep"}}}
+        # aa_repo_match=None must not raise; no packages should be installed
+        # because the source match is skipped entirely.
+        cc_apt._ensure_dependencies(cfg, None, mycloud)
+
 
 class TestAptConfigure:
     @pytest.mark.parametrize(
@@ -320,15 +329,13 @@ class TestAptConfigure:
         Path(sources_file).parent.mkdir(parents=True, exist_ok=True)
         sources_file.write(src_content)
 
-        cfg = {
-            "sources_list": """\
+        cfg = {"sources_list": """\
 Types: deb
 URIs: {{mirror}}
 Suites: {{codename}} {{codename}}-updates {{codename}}-backports
 Components: main restricted universe multiverse
-Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"""
-        }
-        cc_apt.generate_sources_list(cfg, "noble", {}, cloud)
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"""}
+        cc_apt.generate_sources_list(cfg, "noble", {}, cloud, {})
         if expected_content is None:
             assert not sources_file.exists()
             assert f"Removing {sources_file} to favor deb822" in caplog.text

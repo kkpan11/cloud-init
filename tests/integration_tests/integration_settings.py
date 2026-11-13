@@ -8,7 +8,9 @@ from cloudinit.util import is_false, is_true
 # LAUNCH SETTINGS
 ##################################################################
 
-# Keep instance (mostly for debugging) when test is finished
+# Keep instance (mostly for debugging) when test is finished.
+# Can be True, False, or "ON_ERROR" to keep the instance only if the test
+# fails.
 KEEP_INSTANCE = False
 # Keep snapshot image (mostly for debugging) when test is finished
 KEEP_IMAGE = False
@@ -36,16 +38,32 @@ INSTANCE_TYPE: Optional[str] = None
 # This can be the name of an Ubuntu release, or in the format
 # <image_id>[::<os>::<release>::<version>].  If given, os and release should
 # describe the image specified by image_id.  (Ubuntu releases are converted
-# to this format internally; in this case, to "None::ubuntu::focal::20.04".)
-OS_IMAGE = "focal"
+# to this format internally; in this case, to "None::ubuntu::resolute::26.04".)
+OS_IMAGE = "resolute"
+
+
+# Determines unique image type or flavor to exercise if the cloud supports
+# image-type lookup for daily_image and released_images.
+#
+# One of the following pycloudlib.cloud.ImageType values:
+# - generic
+# - minimal
+# - Pro
+# - Pro FIPS
+OS_IMAGE_TYPE = "generic"
 
 # Populate if you want to use a pre-launched instance instead of
 # creating a new one. The exact contents will be platform dependent
 EXISTING_INSTANCE_ID: Optional[str] = None
 
+# Username to use when launching the instance.
+# If not set, the default username for the platform will be used.
+LAUNCH_USERNAME: Optional[str] = None
+
 ##################################################################
 # IMAGE GENERATION SETTINGS
 ##################################################################
+
 
 # Depending on where we are in the development / test / SRU cycle, we'll want
 # different methods of getting the source code to our SUT. Because of
@@ -69,7 +87,11 @@ EXISTING_INSTANCE_ID: Optional[str] = None
 #   Install from a PPA. It MUST start with 'ppa:'
 # <file path>
 #   A path to a valid package to be uploaded and installed
-CLOUD_INIT_SOURCE = "NONE"
+CLOUD_INIT_SOURCE = "IN_PLACE"
+
+# cloud-init metapackage to install
+# Examples: cloud-init, cloud-init-base, cloud-init-smart-os
+CLOUD_INIT_PKG = "cloud-init"
 
 # Before an instance is torn down, we run `cloud-init collect-logs`
 # and transfer them locally. These settings specify when to collect these

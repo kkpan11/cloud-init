@@ -20,7 +20,7 @@ CLOUD_SYSTEM_TARGET="/usr/lib/systemd/system/cloud-init.target"
 {% else %}
 CLOUD_SYSTEM_TARGET="/lib/systemd/system/cloud-init.target"
 {% endif %}
-{% if variant in ["almalinux", "centos", "cloudlinux", "eurolinux", "fedora",
+{% if variant in ["almalinux", "azurelinux", "centos", "cloudlinux", "eurolinux", "fedora",
                   "miraclelinux", "openeuler", "OpenCloudOS", "openmandriva", "rhel", "rocky", "TencentOS", "virtuozzo"] %}
     dsidentify="/usr/libexec/cloud-init/ds-identify"
 {% elif variant == "benchmark" %}
@@ -68,7 +68,7 @@ main() {
         if [ "$ds" = "1" ]; then
             debug 1 "cloud-init is enabled but no datasource found, disabling"
         else
-            debug 1 "cloud-init is disabled by kernel commandline or etc_file"
+            debug 1 "cloud-init is disabled by kernel command line or etc_file"
         fi
         if [ -f "$link_path" ]; then
             if rm -f "$link_path"; then

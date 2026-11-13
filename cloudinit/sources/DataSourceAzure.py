@@ -5,22 +5,25 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
 import base64
-import functools
 import logging
 import os
 import os.path
 import re
 import socket
+import warnings
 import xml.etree.ElementTree as ET  # nosec B405
 from enum import Enum
 from pathlib import Path
-from time import sleep, time
-from typing import Any, Dict, List, Optional
+from time import monotonic, sleep, time
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
-from cloudinit import net, sources, ssh_util, subp, util
+from cloudinit import net, performance, sources, subp, util
+from cloudinit.config import cc_mounts
+from cloudinit.distros import Distro
 from cloudinit.event import EventScope, EventType
+from cloudinit.helpers import Paths
 from cloudinit.net import device_driver
 from cloudinit.net.dhcp import (
     NoDHCPLeaseError,
@@ -29,7 +32,7 @@ from cloudinit.net.dhcp import (
 )
 from cloudinit.net.ephemeral import EphemeralDHCPv4, EphemeralIPv4Network
 from cloudinit.reporting import events
-from cloudinit.sources.azure import errors, identity, imds, kvp
+from cloudinit.sources.azure import certs, errors, identity, imds, kvp
 from cloudinit.sources.helpers import netlink
 from cloudinit.sources.helpers.azure import (
     DEFAULT_WIRESERVER_ENDPOINT,
@@ -47,29 +50,6 @@ from cloudinit.sources.helpers.azure import (
     report_failure_to_fabric,
 )
 from cloudinit.url_helper import UrlError
-
-try:
-    import crypt
-
-    blowfish_hash: Any = functools.partial(
-        crypt.crypt, salt=f"$6${util.rand_str(strlen=16)}"
-    )
-except (ImportError, AttributeError):
-    try:
-        import passlib.hash
-
-        blowfish_hash = passlib.hash.sha512_crypt.hash
-    except ImportError:
-
-        def blowfish_hash(_):
-            """Raise when called so that importing this module doesn't throw
-            ImportError when ds_detect() returns false. In this case, crypt
-            and passlib are not needed.
-            """
-            raise ImportError(
-                "crypt and passlib not found, missing dependency"
-            )
-
 
 LOG = logging.getLogger(__name__)
 
@@ -160,6 +140,35 @@ def find_dev_from_busdev(camcontrol_out: str, busdev: str) -> Optional[str]:
                 dev_pass = items[1].split(",")
                 return dev_pass[0]
     return None
+
+
+def hash_password(password: str) -> str:
+    """Hash a password using SHA-512 crypt.
+
+    Try to use crypt, falling back to passlib.
+
+    If neither are available, raise ReportableErrorImportError.
+
+    :param password: plaintext password to hash.
+    :return: The hashed password string.
+    :raises ReportableErrorImportError: If crypt and passlib are unavailable.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=DeprecationWarning)
+            import crypt  # pylint: disable=W4901
+
+        salt = crypt.mksalt(crypt.METHOD_SHA512)
+        return crypt.crypt(password, salt)
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        import passlib.hash
+
+        return passlib.hash.sha512_crypt.hash(password)
+    except ImportError as error:
+        raise errors.ReportableErrorImportError(error=error) from error
 
 
 def normalize_mac_address(mac: str) -> str:
@@ -288,6 +297,9 @@ BUILTIN_DS_CONFIG = {
     "disk_aliases": {"ephemeral0": RESOURCE_DISK_PATH},
     "apply_network_config": True,  # Use IMDS published network configuration
     "apply_network_config_for_secondary_ips": True,  # Configure secondary ips
+    "experimental_fail_on_missing_customdata": False,
+    "apply_network_config_set_name": True,  # Use set-name for NICs
+    "experimental_skip_ready_report": False,  # Skip final ready report
 }
 
 BUILTIN_CLOUD_EPHEMERAL_DISK_CONFIG = {
@@ -303,7 +315,6 @@ BUILTIN_CLOUD_EPHEMERAL_DISK_CONFIG = {
 
 DS_CFG_PATH = ["datasource", DS_NAME]
 DS_CFG_KEY_PRESERVE_NTFS = "never_destroy_ntfs"
-DEF_EPHEMERAL_LABEL = "Temporary Storage"
 
 # The redacted password fails to meet password complexity requirements
 # so we can safely use this to mask/redact the password in the ovf-env.xml
@@ -319,38 +330,51 @@ class DataSourceAzure(sources.DataSource):
         }
     }
     _negotiated = False
-    _metadata_imds = sources.UNSET
+    _metadata_imds: Union[str, Dict[str, Any]] = sources.UNSET
     _ci_pkl_version = 1
 
-    def __init__(self, sys_cfg, distro, paths):
+    def __init__(
+        self, sys_cfg: Dict[str, Any], distro: Distro, paths: Paths
+    ) -> None:
         sources.DataSource.__init__(self, sys_cfg, distro, paths)
         self.seed_dir = os.path.join(paths.seed_dir, "azure")
-        self.cfg = {}
-        self.seed = None
+        self.cfg: Dict[str, Any] = {}
+        self.seed: Optional[str] = None
         self.ds_cfg = util.mergemanydict(
             [util.get_cfg_by_path(sys_cfg, DS_CFG_PATH, {}), BUILTIN_DS_CONFIG]
         )
-        self._iso_dev = None
-        self._network_config = None
-        self._ephemeral_dhcp_ctx = None
-        self._route_configured_for_imds = False
-        self._route_configured_for_wireserver = False
-        self._wireserver_endpoint = DEFAULT_WIRESERVER_ENDPOINT
+        self._iso_dev: Optional[str] = None
+        self._network_config: Optional[Dict[str, Any]] = None
+        self._ephemeral_dhcp_ctx: Optional[EphemeralDHCPv4] = None
         self._reported_ready_marker_file = os.path.join(
             paths.cloud_dir, "data", "reported_ready"
         )
+        self._route_configured_for_imds = False
+        self._route_configured_for_wireserver = False
+        self._system_uuid: Optional[str] = None
+        self._vm_id: Optional[str] = None
+        self._wireserver_endpoint = DEFAULT_WIRESERVER_ENDPOINT
 
     def _unpickle(self, ci_pkl_version: int) -> None:
         super()._unpickle(ci_pkl_version)
 
         self._ephemeral_dhcp_ctx = None
         self._iso_dev = None
-        self._route_configured_for_imds = False
-        self._route_configured_for_wireserver = False
-        self._wireserver_endpoint = DEFAULT_WIRESERVER_ENDPOINT
         self._reported_ready_marker_file = os.path.join(
             self.paths.cloud_dir, "data", "reported_ready"
         )
+        self._route_configured_for_imds = False
+        self._route_configured_for_wireserver = False
+        self._system_uuid = None
+        self._vm_id = None
+        self._wireserver_endpoint = DEFAULT_WIRESERVER_ENDPOINT
+        for key in (
+            "apply_network_config_for_secondary_ips",
+            "experimental_fail_on_missing_customdata",
+            "apply_network_config_set_name",
+            "experimental_skip_ready_report",
+        ):
+            self.ds_cfg.setdefault(key, BUILTIN_DS_CONFIG[key])
 
     def __str__(self):
         root = sources.DataSource.__str__(self)
@@ -416,19 +440,15 @@ class DataSourceAzure(sources.DataSource):
                 "Bringing up networking when already configured."
             )
 
-        report_diagnostic_event(
-            "Bringing up ephemeral networking with iface=%s: %r"
-            % (iface, net.get_interfaces()),
-            logger_func=LOG.debug,
-        )
         self._ephemeral_dhcp_ctx = EphemeralDHCPv4(
             self.distro,
             iface=iface,
             dhcp_log_func=dhcp_log_cb,
         )
 
-        lease = None
-        start_time = time()
+        update_primary_nic = iface is None
+        lease: Optional[Dict[str, Any]] = None
+        start_time = monotonic()
         deadline = start_time + timeout_minutes * 60
         with events.ReportEventStack(
             name="obtain-dhcp-lease",
@@ -437,6 +457,19 @@ class DataSourceAzure(sources.DataSource):
         ):
             while lease is None:
                 try:
+                    if update_primary_nic:
+                        iface = find_primary_nic()
+
+                    mac, driver = get_interface_details(iface)
+
+                    report_diagnostic_event(
+                        "Bringing up ephemeral networking with "
+                        "iface=%s mac=%s driver=%s: %r"
+                        % (iface, mac, driver, net.get_interfaces()),
+                        logger_func=LOG.debug,
+                    )
+
+                    self._ephemeral_dhcp_ctx.iface = iface
                     lease = self._ephemeral_dhcp_ctx.obtain_lease()
                 except NoDHCPLeaseInterfaceError:
                     # Interface not found, continue after sleeping 1 second.
@@ -445,7 +478,7 @@ class DataSourceAzure(sources.DataSource):
                     )
                     self._report_failure(
                         errors.ReportableErrorDhcpInterfaceNotFound(
-                            duration=time() - start_time
+                            duration=monotonic() - start_time
                         ),
                         host_only=True,
                     )
@@ -459,14 +492,23 @@ class DataSourceAzure(sources.DataSource):
                 except NoDHCPLeaseError:
                     # Typical DHCP failure, continue after sleeping 1 second.
                     report_diagnostic_event(
-                        "Failed to obtain DHCP lease (iface=%s)" % iface,
+                        "Failed to obtain DHCP lease "
+                        "(iface=%s mac=%s driver=%s)" % (iface, mac, driver),
                         logger_func=LOG.error,
                     )
                     self._report_failure(
                         errors.ReportableErrorDhcpLease(
-                            duration=time() - start_time, interface=iface
+                            driver=driver,
+                            duration=monotonic() - start_time,
+                            interface=iface,
+                            mac_address=mac,
                         ),
                         host_only=True,
+                    )
+                except FileNotFoundError as error:
+                    report_diagnostic_event(
+                        "File not found during DHCP %r" % error,
+                        logger_func=LOG.error,
                     )
                 except subp.ProcessExecutionError as error:
                     # udevadm settle, ip link set dev eth0 up, etc.
@@ -483,7 +525,7 @@ class DataSourceAzure(sources.DataSource):
                     )
 
                 # Sleep before retrying, otherwise break if past deadline.
-                if lease is None and time() + retry_sleep < deadline:
+                if lease is None and monotonic() + retry_sleep < deadline:
                     sleep(retry_sleep)
                 else:
                     break
@@ -554,6 +596,60 @@ class DataSourceAzure(sources.DataSource):
             or self._ephemeral_dhcp_ctx.lease is None
         )
 
+    def _check_azure_proxy_agent_status(self) -> None:
+        """Check if azure-proxy-agent is ready for communication with WS/IMDS.
+
+        If ProvisionGuestProxyAgent is true, query azure-proxy-agent status,
+        waiting up to 120 seconds for the proxy to negotiate with Wireserver
+        and configure an eBPF proxy.  Once azure-proxy-agent is ready,
+        it will exit with code 0 and cloud-init can then expect to be able to
+        communicate with these services.
+
+        Fail deployment if azure-proxy-agent is not found or otherwise returns
+        an error.
+
+        For more information, check out:
+        https://github.com/azure/guestproxyagent
+        """
+        try:
+            cmd = [
+                "azure-proxy-agent",
+                "--status",
+                "--wait",
+                "120",
+            ]
+            out, err = subp.subp(cmd)
+            report_diagnostic_event(
+                "Executing %s resulted "
+                "in stderr=%r with stdout=%r" % (cmd, err, out),
+                logger_func=LOG.debug,
+            )
+        except subp.ProcessExecutionError as error:
+            if isinstance(error.reason, FileNotFoundError):
+                LOG.error(
+                    "Failed to activate Azure Guest Proxy Agent: "
+                    "azure-proxy-agent not found"
+                )
+                report_error = errors.ReportableErrorProxyAgentNotFound()
+                self._report_failure(report_error)
+            else:
+                report_diagnostic_event(
+                    "Failed to activate Azure Guest Proxy Agent: "
+                    "status check failed "
+                    "cmd=%r stderr=%r stdout=%r exit_code=%s"
+                    % (
+                        error.cmd,
+                        error.stderr,
+                        error.stdout,
+                        error.exit_code,
+                    ),
+                    logger_func=LOG.error,
+                )
+                reportable_error = (
+                    errors.ReportableErrorProxyAgentStatusFailure(error)
+                )
+                self._report_failure(reportable_error)
+
     @azure_ds_telemetry_reporter
     def crawl_metadata(self):
         """Walk all instance metadata sources returning a dict on success.
@@ -562,7 +658,14 @@ class DataSourceAzure(sources.DataSource):
         @raise: InvalidMetaDataException when the expected metadata service is
             unavailable, broken or disabled.
         """
-        crawled_data = {}
+        self._query_vm_id()
+        report_diagnostic_event(
+            "Azure VM ID: %s System UUID: %s"
+            % (self._vm_id, self._system_uuid),
+            logger_func=LOG.info,
+        )
+
+        crawled_data: Dict[str, Any] = {}
         # azure removes/ejects the cdrom containing the ovf-env.xml
         # file on reboot.  So, in order to successfully reboot we
         # need to look in the datadir and consider that valid
@@ -572,7 +675,6 @@ class DataSourceAzure(sources.DataSource):
         # it determines the value of ret. More specifically, the first one in
         # the candidate list determines the path to take in order to get the
         # metadata we need.
-        ovf_source = None
         md = {"local-hostname": ""}
         cfg = {"system_info": {"default_user": {"name": ""}}}
         userdata_raw = ""
@@ -594,9 +696,9 @@ class DataSourceAzure(sources.DataSource):
                 else:
                     md, userdata_raw, cfg, files = load_azure_ds_dir(src)
 
-                ovf_source = src
+                self.seed = src
                 report_diagnostic_event(
-                    "Found provisioning metadata in %s" % ovf_source,
+                    "Found provisioning metadata in %s" % self.seed,
                     logger_func=LOG.debug,
                 )
                 break
@@ -624,7 +726,7 @@ class DataSourceAzure(sources.DataSource):
         # not have UDF support.  In either case, require IMDS metadata.
         # If we require IMDS metadata, try harder to obtain networking, waiting
         # for at least 20 minutes.  Otherwise only wait 5 minutes.
-        requires_imds_metadata = bool(self._iso_dev) or ovf_source is None
+        requires_imds_metadata = bool(self._iso_dev) or self.seed is None
         timeout_minutes = 20 if requires_imds_metadata else 5
         try:
             self._setup_ephemeral_networking(timeout_minutes=timeout_minutes)
@@ -633,16 +735,25 @@ class DataSourceAzure(sources.DataSource):
 
         imds_md = {}
         if self._is_ephemeral_networking_up():
+            # check if azure-proxy-agent is enabled in the ovf-env.xml file.
+            # azure-proxy-agent feature is opt-in and disabled by default.
+            if cfg.get("ProvisionGuestProxyAgent"):
+                self._check_azure_proxy_agent_status()
+
             imds_md = self.get_metadata_from_imds(report_failure=True)
 
-        if not imds_md and ovf_source is None:
+        if not imds_md and self.seed is None:
             msg = "No OVF or IMDS available"
             report_diagnostic_event(msg)
             raise sources.InvalidMetaDataException(msg)
 
+        self.seed = self.seed or "IMDS"
+
         # Refresh PPS type using metadata.
         pps_type = self._determine_pps_type(cfg, imds_md)
         if pps_type != PPSType.NONE:
+            self.seed = "IMDS"
+
             if util.is_FreeBSD():
                 msg = "Free BSD is not supported for PPS VMs"
                 report_diagnostic_event(msg, logger_func=LOG.error)
@@ -664,6 +775,9 @@ class DataSourceAzure(sources.DataSource):
                 self._wait_for_pps_unknown_reuse()
 
             md, userdata_raw, cfg, files = self._reprovision()
+            if cfg.get("ProvisionGuestProxyAgent"):
+                self._check_azure_proxy_agent_status()
+
             # fetch metadata again as it has changed after reprovisioning
             imds_md = self.get_metadata_from_imds(report_failure=True)
 
@@ -679,7 +793,6 @@ class DataSourceAzure(sources.DataSource):
         # Report errors if IMDS network configuration is missing data.
         self.validate_imds_network_metadata(imds_md=imds_md)
 
-        self.seed = ovf_source or "IMDS"
         crawled_data.update(
             {
                 "cfg": cfg,
@@ -697,21 +810,19 @@ class DataSourceAzure(sources.DataSource):
         if imds_hostname:
             LOG.debug("Hostname retrieved from IMDS: %s", imds_hostname)
             crawled_data["metadata"]["local-hostname"] = imds_hostname
-        if imds_disable_password:
+        if imds_disable_password is not None:
             LOG.debug(
                 "Disable password retrieved from IMDS: %s",
                 imds_disable_password,
             )
-            crawled_data["metadata"][
-                "disable_password"
-            ] = imds_disable_password
+            crawled_data["cfg"]["ssh_pwauth"] = not imds_disable_password
 
         if self.seed == "IMDS" and not crawled_data["files"]:
             try:
                 contents = build_minimal_ovf(
-                    username=imds_username,  # pyright: ignore
-                    hostname=imds_hostname,  # pyright: ignore
-                    disableSshPwd=imds_disable_password,  # pyright: ignore
+                    username=imds_username,
+                    hostname=imds_hostname,
+                    disable_ssh_password_auth=imds_disable_password,
                 )
                 crawled_data["files"] = {"ovf-env.xml": contents}
             except Exception as e:
@@ -720,9 +831,31 @@ class DataSourceAzure(sources.DataSource):
                     logger_func=LOG.debug,
                 )
 
-        # only use userdata from imds if OVF did not provide custom data
-        # userdata provided by IMDS is always base64 encoded
+        # Only use userdata from IMDS if OVF did not provide custom data.
+        # Userdata provided by IMDS is always base64 encoded.
         if not userdata_raw:
+            # First, check to see if the OVF was supposed to provide custom
+            # data. If it was supposed to and did not, we report failure.
+            has_custom_data = _hascustomdata_from_imds(imds_md)
+            if has_custom_data:
+                if self.ds_cfg.get("experimental_fail_on_missing_customdata"):
+                    self._report_failure(
+                        errors.ReportableErrorMissingCustomData(
+                            pps_type=pps_type.value,
+                            provisioning_media=self.seed or "",
+                        )
+                    )
+                else:
+                    report_diagnostic_event(
+                        "Did not find custom data in %s, IMDS returned"
+                        " extended.compute.hasCustomData=%r"
+                        % (
+                            self.seed,
+                            has_custom_data,
+                        ),
+                        logger_func=LOG.error,
+                    )
+
             imds_userdata = _userdata_from_imds(imds_md)
             if imds_userdata:
                 LOG.debug("Retrieved userdata from IMDS")
@@ -735,7 +868,7 @@ class DataSourceAzure(sources.DataSource):
                         "Bad userdata in IMDS", logger_func=LOG.warning
                     )
 
-        if ovf_source == ddir:
+        if self.seed == ddir:
             report_diagnostic_event(
                 "using files cached in %s" % ddir, logger_func=LOG.debug
             )
@@ -746,27 +879,34 @@ class DataSourceAzure(sources.DataSource):
         crawled_data["metadata"]["instance-id"] = self._iid()
 
         if self._negotiated is False and self._is_ephemeral_networking_up():
-            # Report ready and fetch public-keys from Wireserver, if required.
-            pubkey_info = self._determine_wireserver_pubkey_info(
-                cfg=cfg, imds_md=imds_md
-            )
-            try:
-                ssh_keys = self._report_ready(pubkey_info=pubkey_info)
-            except Exception:
-                # Failed to report ready, but continue with best effort.
-                pass
+            if self.ds_cfg.get("experimental_skip_ready_report", False):
+                LOG.debug(
+                    "Skipping final health report as "
+                    "experimental_skip_ready_report is enabled."
+                )
             else:
-                LOG.debug("negotiating returned %s", ssh_keys)
-                if ssh_keys:
-                    crawled_data["metadata"]["public-keys"] = ssh_keys
+                # Report ready and fetch public-keys from Wireserver,
+                # if required.
+                pubkey_info = self._determine_wireserver_pubkey_info(
+                    cfg=cfg, imds_md=imds_md
+                )
+                try:
+                    ssh_keys = self._report_ready(pubkey_info=pubkey_info)
+                except Exception:
+                    # Failed to report ready, but continue with best effort.
+                    pass
+                else:
+                    LOG.debug("negotiating returned %s", ssh_keys)
+                    if ssh_keys:
+                        crawled_data["metadata"]["public-keys"] = ssh_keys
 
-                self._cleanup_markers()
+            self._cleanup_markers()
 
         return crawled_data
 
     @azure_ds_telemetry_reporter
     def get_metadata_from_imds(self, report_failure: bool) -> Dict:
-        start_time = time()
+        start_time = monotonic()
         retry_deadline = start_time + 300
 
         # As a temporary workaround to support Azure Stack implementations
@@ -785,7 +925,7 @@ class DataSourceAzure(sources.DataSource):
             )
         except UrlError as error:
             error_string = str(error)
-            duration = time() - start_time
+            duration = monotonic() - start_time
             error_report = errors.ReportableErrorImdsUrlError(
                 exception=error, duration=duration
             )
@@ -825,9 +965,6 @@ class DataSourceAzure(sources.DataSource):
             return True
 
         # If no valid chassis tag, check for seeded ovf-env.xml.
-        if self.seed_dir is None:
-            return False
-
         return Path(self.seed_dir, "ovf-env.xml").exists()
 
     @azure_ds_telemetry_reporter
@@ -848,11 +985,7 @@ class DataSourceAzure(sources.DataSource):
             LOG.warning("Failed to get system information: %s", e)
 
         try:
-            crawled_data = util.log_time(
-                logfunc=LOG.debug,
-                msg="Crawl of metadata service",
-                func=self.crawl_metadata,
-            )
+            crawled_data = self.crawl_metadata()
         except errors.ReportableError as error:
             self._report_failure(error)
             return False
@@ -945,7 +1078,9 @@ class DataSourceAzure(sources.DataSource):
             report_diagnostic_event(log_msg, logger_func=LOG.debug)
             raise
 
-        if any(not _key_is_openssh_formatted(key=key) for key in ssh_keys):
+        ssh_keys = [certs.sanitize_openssh_key(key) for key in ssh_keys]
+
+        if any(not certs.is_openssh_formatted(key) for key in ssh_keys):
             log_msg = "Key(s) not in OpenSSH format"
             report_diagnostic_event(log_msg, logger_func=LOG.debug)
             raise ValueError(log_msg)
@@ -977,13 +1112,45 @@ class DataSourceAzure(sources.DataSource):
         # quickly (local check only) if self.instance_id is still valid
         return sources.instance_id_matches_system_uuid(self.get_instance_id())
 
+    def _query_vm_id(self):
+        """Query the system UUID and VM IDs, if needed.
+
+        They are initialized to None, check only if they are unset.
+
+        Raise as reportable error on failure.
+        """
+        if not self._system_uuid:
+            try:
+                self._system_uuid = identity.query_system_uuid()
+            except RuntimeError as error:
+                raise errors.ReportableErrorVmIdentification(exception=error)
+
+        if not self._vm_id:
+            system_uuid = self._system_uuid
+            if system_uuid is None:
+                raise errors.ReportableErrorVmIdentification(
+                    exception=RuntimeError("system_uuid unavailable"),
+                )
+            try:
+                self._vm_id = identity.convert_system_uuid_to_vm_id(
+                    system_uuid
+                )
+            except ValueError as error:
+                raise errors.ReportableErrorVmIdentification(
+                    exception=error, system_uuid=system_uuid
+                )
+
     def _iid(self, previous=None):
+        self._query_vm_id()
+
         prev_iid_path = os.path.join(
             self.paths.get_cpath("data"), "instance-id"
         )
-        system_uuid = identity.query_system_uuid()
         if os.path.exists(prev_iid_path):
             previous = util.load_text_file(prev_iid_path).strip()
+            system_uuid = self._system_uuid
+            if system_uuid is None:
+                return None
             swapped_id = identity.byte_swap_system_uuid(system_uuid)
 
             # Older kernels than 4.15 will have UPPERCASE product_uuid.
@@ -992,7 +1159,7 @@ class DataSourceAzure(sources.DataSource):
             # LP: #1835584
             if previous.lower() in [system_uuid, swapped_id]:
                 return previous
-        return system_uuid
+        return self._system_uuid
 
     @azure_ds_telemetry_reporter
     def _wait_for_nic_detach(self, nl_sock):
@@ -1103,7 +1270,7 @@ class DataSourceAzure(sources.DataSource):
         """Wait until the primary nic for the vm is hot-attached."""
         LOG.info("Waiting for primary nic to be hot-attached")
         try:
-            nics_found = []
+            nics_found: List[Any] = []
             primary_nic_found = False
 
             # Wait for netlink nic attach events. After the first nic is
@@ -1253,7 +1420,7 @@ class DataSourceAzure(sources.DataSource):
     def _poll_imds(self) -> bytes:
         """Poll IMDs for reprovisiondata XML document data."""
         dhcp_attempts = 0
-        reprovision_data = None
+        reprovision_data: Optional[bytes] = None
         while not reprovision_data:
             if not self._is_ephemeral_networking_up():
                 dhcp_attempts += 1
@@ -1293,12 +1460,13 @@ class DataSourceAzure(sources.DataSource):
         @param host_only: Only report to host (error may be recoverable).
         @return: The success status of sending the failure signal.
         """
+        encoded_report = error.as_encoded_report(vm_id=self._vm_id)
         report_diagnostic_event(
-            f"Azure datasource failure occurred: {error.as_encoded_report()}",
+            f"Azure datasource failure occurred: {encoded_report}",
             logger_func=LOG.error,
         )
         report_dmesg_to_kvp()
-        reported = kvp.report_failure_to_host(error)
+        reported = kvp.report_via_kvp(encoded_report)
         if host_only:
             return reported
 
@@ -1310,7 +1478,8 @@ class DataSourceAzure(sources.DataSource):
                     logger_func=LOG.debug,
                 )
                 report_failure_to_fabric(
-                    endpoint=self._wireserver_endpoint, error=error
+                    endpoint=self._wireserver_endpoint,
+                    encoded_report=encoded_report,
                 )
                 self._negotiated = True
                 return True
@@ -1333,7 +1502,8 @@ class DataSourceAzure(sources.DataSource):
                 # Reporting failure will fail, but it will emit telemetry.
                 pass
             report_failure_to_fabric(
-                endpoint=self._wireserver_endpoint, error=error
+                endpoint=self._wireserver_endpoint,
+                encoded_report=encoded_report,
             )
             self._negotiated = True
             return True
@@ -1358,7 +1528,7 @@ class DataSourceAzure(sources.DataSource):
         :returns: List of SSH keys, if requested.
         """
         report_dmesg_to_kvp()
-        kvp.report_success_to_host()
+        kvp.report_success_to_host(vm_id=self._vm_id)
 
         try:
             data = get_metadata_from_fabric(
@@ -1482,17 +1652,18 @@ class DataSourceAzure(sources.DataSource):
     def _generate_network_config(self):
         """Generate network configuration according to configuration."""
         # Use IMDS network metadata, if configured.
-        if (
-            self._metadata_imds
-            and self._metadata_imds != sources.UNSET
-            and self.ds_cfg.get("apply_network_config")
+        if isinstance(self._metadata_imds, dict) and self.ds_cfg.get(
+            "apply_network_config"
         ):
             try:
                 return generate_network_config_from_instance_network_metadata(
                     self._metadata_imds["network"],
-                    apply_network_config_for_secondary_ips=self.ds_cfg.get(
+                    apply_network_config_for_secondary_ips=self.ds_cfg[
                         "apply_network_config_for_secondary_ips"
-                    ),
+                    ],
+                    apply_network_config_set_name=self.ds_cfg[
+                        "apply_network_config_set_name"
+                    ],
                 )
             except Exception as e:
                 LOG.error(
@@ -1513,7 +1684,7 @@ class DataSourceAzure(sources.DataSource):
     def network_config(self):
         """Provide network configuration v2 dictionary."""
         # Use cached config, if present.
-        if self._network_config and self._network_config != sources.UNSET:
+        if self._network_config:
             return self._network_config
 
         self._network_config = self._generate_network_config()
@@ -1571,6 +1742,18 @@ class DataSourceAzure(sources.DataSource):
 
         return False
 
+    def _cleanup_resourcedisk_fstab(self):
+        """
+        Remove resource disk entries from fstab, which are configured
+        by cloud-init i.e. lines containing "/dev/disk/cloud/azure_resource"
+        and cloudconfig comment.
+        """
+        cc_mounts.cleanup_fstab(RESOURCE_DISK_PATH)
+
+    def clean(self):
+        # Azure-specific cleanup logic for "cloud-init clean -c datasource"
+        self._cleanup_resourcedisk_fstab()
+
 
 def _username_from_imds(imds_data):
     try:
@@ -1582,6 +1765,13 @@ def _username_from_imds(imds_data):
 def _userdata_from_imds(imds_data):
     try:
         return imds_data["compute"]["userData"]
+    except KeyError:
+        return None
+
+
+def _hascustomdata_from_imds(imds_data: Dict) -> Optional[bool]:
+    try:
+        return imds_data["extended"]["compute"]["hasCustomData"]
     except KeyError:
         return None
 
@@ -1601,23 +1791,6 @@ def _disable_password_from_imds(imds_data):
         )
     except KeyError:
         return None
-
-
-def _key_is_openssh_formatted(key):
-    """
-    Validate whether or not the key is OpenSSH-formatted.
-    """
-    # See https://bugs.launchpad.net/cloud-init/+bug/1910835
-    if "\r\n" in key.strip():
-        return False
-
-    parser = ssh_util.AuthKeyLineParser()
-    try:
-        akl = parser.parse(key)
-    except TypeError:
-        return False
-
-    return akl.keytype is not None
 
 
 def _partitions_on_device(devpath, maxnum=16):
@@ -1676,15 +1849,18 @@ def can_dev_be_reformatted(devpath, preserve_ntfs):
     # devpath of /dev/sd[a-z] or /dev/disk/cloud/azure_resource
     # where partitions are "<devpath>1" or "<devpath>-part1" or "<devpath>p1"
     partitions = _partitions_on_device(devpath)
-    if len(partitions) == 0:
+    if not partitions:
         return False, "device %s was not partitioned" % devpath
-    elif len(partitions) > 2:
+
+    partition_len = len(partitions)
+    if partition_len > 2:
         msg = "device %s had 3 or more partitions: %s" % (
             devpath,
             " ".join([p[1] for p in partitions]),
         )
         return False, msg
-    elif len(partitions) == 2:
+
+    if partition_len == 2:
         cand_part, cand_path = partitions[1]
     else:
         cand_part, cand_path = partitions[0]
@@ -1824,7 +2000,9 @@ def write_files(datadir, files, dirmode=None):
 
 
 @azure_ds_telemetry_reporter
-def read_azure_ovf(contents):
+def read_azure_ovf(
+    contents: str,
+) -> Tuple[Dict[str, Any], Union[bytes, str], Dict[str, Any]]:
     """Parse OVF XML contents.
 
     :return: Tuple of metadata, configuration, userdata dicts.
@@ -1834,7 +2012,7 @@ def read_azure_ovf(contents):
     """
     ovf_env = OvfEnvXml.parse_text(contents)
     md: Dict[str, Any] = {}
-    cfg = {}
+    cfg: Dict[str, Any] = {}
     ud = ovf_env.custom_data or ""
 
     if ovf_env.hostname:
@@ -1848,13 +2026,13 @@ def read_azure_ovf(contents):
     elif ovf_env.password:
         cfg["ssh_pwauth"] = True
 
-    defuser = {}
+    defuser: Dict[str, Any] = {}
     if ovf_env.username:
         defuser["name"] = ovf_env.username
     if ovf_env.password:
         defuser["lock_passwd"] = False
         if DEF_PASSWD_REDACTION != ovf_env.password:
-            defuser["hashed_passwd"] = encrypt_pass(ovf_env.password)
+            defuser["hashed_passwd"] = hash_password(ovf_env.password)
 
     if defuser:
         cfg["system_info"] = {"default_user": defuser}
@@ -1879,8 +2057,12 @@ def read_azure_ovf(contents):
     return (md, ud, cfg)
 
 
-def encrypt_pass(password):
-    return blowfish_hash(password)
+def find_primary_nic():
+    candidate_nics = net.find_candidate_nics()
+    if candidate_nics:
+        return candidate_nics[0]
+
+    return None
 
 
 @azure_ds_telemetry_reporter
@@ -1938,7 +2120,7 @@ def load_azure_ds_dir(source_dir):
     if not os.path.isfile(ovf_file):
         raise NonAzureDataSource("No ovf-env file found")
 
-    with open(ovf_file, "rb") as fp:
+    with performance.Timed("Reading ovf-env.xml"), open(ovf_file, "rb") as fp:
         contents = fp.read()
 
     md, ud, cfg = read_azure_ovf(contents)
@@ -1950,6 +2132,7 @@ def generate_network_config_from_instance_network_metadata(
     network_metadata: dict,
     *,
     apply_network_config_for_secondary_ips: bool,
+    apply_network_config_set_name: bool,
 ) -> dict:
     """Convert imds network metadata dictionary to network v2 configuration.
 
@@ -1963,8 +2146,15 @@ def generate_network_config_from_instance_network_metadata(
         # First IPv4 and/or IPv6 address will be obtained via DHCP.
         # Any additional IPs of each type will be set as static
         # addresses.
-        nicname = "eth{idx}".format(idx=idx)
+        mac = normalize_mac_address(intf["macAddress"])
+        if apply_network_config_set_name:
+            nicname = "eth{idx}".format(idx=idx)
+        else:
+            nicname = "enx{mac}".format(mac=mac.replace(":", ""))
         dhcp_override = {"route-metric": (idx + 1) * 100}
+        # DNS resolution through secondary NICs is not supported, disable it.
+        if idx > 0:
+            dhcp_override["use-dns"] = False
         dev_config: Dict[str, Any] = {
             "dhcp4": True,
             "dhcp4-overrides": dhcp_override,
@@ -2004,10 +2194,9 @@ def generate_network_config_from_instance_network_metadata(
                     "{ip}/{prefix}".format(ip=privateIp, prefix=netPrefix)
                 )
         if dev_config and has_ip_address:
-            mac = normalize_mac_address(intf["macAddress"])
-            dev_config.update(
-                {"match": {"macaddress": mac.lower()}, "set-name": nicname}
-            )
+            dev_config["match"] = {"macaddress": mac.lower()}
+            if apply_network_config_set_name:
+                dev_config["set-name"] = nicname
             driver = determine_device_driver_for_mac(mac)
             if driver:
                 dev_config["match"]["driver"] = driver
@@ -2085,3 +2274,17 @@ datasources = [
 # Return a list of data sources that match this set of dependencies
 def get_datasource_list(depends):
     return sources.list_from_depends(depends, datasources)
+
+
+def get_interface_details(
+    iface: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    if iface is None:
+        return None, None
+
+    interfaces = net.get_interfaces()
+    for interface_name, interface_mac, interface_driver, _ in interfaces:
+        if interface_name == iface:
+            return interface_mac, interface_driver
+
+    return None, None

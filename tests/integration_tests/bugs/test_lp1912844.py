@@ -14,6 +14,7 @@ init-local but, of course, before networking is up), and so doesn't generate
 the traceback that they cause.  We work around this by calling
 ``get_interfaces_by_mac` directly in the test code.
 """
+
 import pytest
 
 from tests.integration_tests import random_mac_address
@@ -52,9 +53,7 @@ vlans:
     id: 200
     link: ovs-br
     mtu: 1500
-""".format(
-    MAC_ADDRESS
-)
+""".format(MAC_ADDRESS)
 
 
 SETUP_USER_DATA = """\

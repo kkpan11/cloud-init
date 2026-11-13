@@ -16,31 +16,16 @@ import collections
 import logging
 import re
 import sys
-from typing import Any
 
-from jinja2 import TemplateSyntaxError
+from jinja2 import DebugUndefined, TemplateSyntaxError
+from jinja2.sandbox import SandboxedEnvironment
 
+from cloudinit import performance
 from cloudinit import type_utils as tu
 from cloudinit import util
 from cloudinit.atomic_helper import write_file
 
-# After bionic EOL, mypy==1.0.0 will be able to type-analyse dynamic
-# base types, substitute this by:
-# JUndefined: typing.Type
-JUndefined: Any
-try:
-    from jinja2 import DebugUndefined as _DebugUndefined
-    from jinja2 import Template as JTemplate
-
-    JINJA_AVAILABLE = True
-    JUndefined = _DebugUndefined
-except (ImportError, AttributeError):
-    JINJA_AVAILABLE = False
-    JUndefined = object
-
 LOG = logging.getLogger(__name__)
-TYPE_MATCHER = re.compile(r"##\s*template:(.*)", re.I)
-BASIC_MATCHER = re.compile(r"\$\{([A-Za-z0-9_.]+)\}|\$([A-Za-z0-9_.]+)")
 MISSING_JINJA_PREFIX = "CI_MISSING_JINJA_VAR/"
 
 
@@ -68,7 +53,7 @@ class JinjaSyntaxParsingException(TemplateSyntaxError):
     @staticmethod
     def format_error_message(
         syntax_error: str,
-        line_number: str,
+        line_number: int,
         line_content: str = "",
     ) -> str:
         """Avoid jinja2.TemplateSyntaxError multi-line __str__ format."""
@@ -87,7 +72,7 @@ class JinjaSyntaxParsingException(TemplateSyntaxError):
 
 # Mypy, and the PEP 484 ecosystem in general, does not support creating
 # classes with dynamic base types: https://stackoverflow.com/a/59636248
-class UndefinedJinjaVariable(JUndefined):
+class UndefinedJinjaVariable(DebugUndefined):
     """Class used to represent any undefined jinja template variable."""
 
     def __str__(self):
@@ -103,6 +88,7 @@ class UndefinedJinjaVariable(JUndefined):
         )
 
 
+@performance.timed("Rendering basic template")
 def basic_render(content, params):
     """This does simple replacement of bash variable like templates.
 
@@ -138,7 +124,9 @@ def basic_render(content, params):
             )
         return str(selected_params[key])
 
-    return BASIC_MATCHER.sub(replacer, content)
+    return re.sub(
+        r"\$\{([A-Za-z0-9_.]+)\}|\$([A-Za-z0-9_.]+)", replacer, content
+    )
 
 
 def detect_template(text):
@@ -146,15 +134,13 @@ def detect_template(text):
         # keep_trailing_newline is in jinja2 2.7+, not 2.6
         add = "\n" if content.endswith("\n") else ""
         try:
-            return (
-                JTemplate(
-                    content,
+            with performance.Timed("Rendering jinja2 template"):
+                jinja_env = SandboxedEnvironment(
                     undefined=UndefinedJinjaVariable,
                     trim_blocks=True,
                     extensions=["jinja2.ext.do"],
-                ).render(**params)
-                + add
-            )
+                )
+                return jinja_env.from_string(content).render(**params) + add
         except TemplateSyntaxError as template_syntax_error:
             template_syntax_error.lineno += 1
             raise JinjaSyntaxParsingException(
@@ -168,7 +154,7 @@ def detect_template(text):
     else:
         ident = text
         rest = ""
-    type_match = TYPE_MATCHER.match(ident)
+    type_match = re.match(r"##\s*template:(.*)", ident, re.I)
     if not type_match:
         return ("basic", basic_render, text)
     else:
@@ -178,13 +164,7 @@ def detect_template(text):
                 "Unknown template rendering type '%s' requested"
                 % template_type
             )
-        if template_type == "jinja" and not JINJA_AVAILABLE:
-            LOG.warning(
-                "Jinja not available as the selected renderer for"
-                " desired template, reverting to the basic renderer."
-            )
-            return ("basic", basic_render, rest)
-        elif template_type == "jinja" and JINJA_AVAILABLE:
+        elif template_type == "jinja":
             return ("jinja", jinja_render, rest)
         # Only thing left over is the basic renderer (it is always available).
         return ("basic", basic_render, rest)
@@ -212,8 +192,7 @@ def render_string(content, params):
 
 
 def render_template(variant, template, output, is_yaml, prefix=None):
-    with open(template, "r") as fh:
-        contents = fh.read()
+    contents = util.load_text_file(template)
     tpl_params = {"variant": variant, "prefix": prefix}
     contents = (render_string(contents, tpl_params)).rstrip() + "\n"
     if is_yaml:

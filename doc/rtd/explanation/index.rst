@@ -1,25 +1,20 @@
 Explanation
 ***********
 
-Our explanatory and conceptual guides are written to provide a better
-understanding of how ``cloud-init`` works. They enable you to expand your
-knowledge and become better at using and configuring ``cloud-init``.
+The following guides explain how ``cloud-init`` works.
 
 -----
+
+.. rstcheck: silence "Document may not end with transition" warning
 
 .. toctree::
    :maxdepth: 1
 
-   introduction.rst
-   configuration.rst
-   boot.rst
-   format.rst
-   events.rst
-   instancedata.rst
-   vendordata.rst
-   security.rst
-   analyze.rst
-   kernel-cmdline.rst
-   failure_states.rst
-   exported_errors.rst
-   return_codes.rst
+   Introduction <introduction.rst>
+   Configuration <configuration.rst>
+   Boot stages <boot.rst>
+   Failure modes <failure_states.rst>
+   Project status <project-status.rst>
+   Hardening <hardening.rst>
+   FAQ <faq.rst>
+   Advanced explanation <advanced_explanation.rst>

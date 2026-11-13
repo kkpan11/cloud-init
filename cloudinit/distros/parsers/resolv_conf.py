@@ -57,13 +57,13 @@ class ResolvConf:
     def __str__(self):
         self.parse()
         contents = StringIO()
-        for (line_type, components) in self._contents:
+        for line_type, components in self._contents:
             if line_type == "blank":
                 contents.write("\n")
             elif line_type == "all_comment":
                 contents.write("%s\n" % (components[0]))
             elif line_type == "option":
-                (cfg_opt, cfg_value, comment_tail) = components
+                cfg_opt, cfg_value, comment_tail = components
                 line = "%s %s" % (cfg_opt, cfg_value)
                 if len(comment_tail):
                     line += comment_tail
@@ -72,9 +72,9 @@ class ResolvConf:
 
     def _retr_option(self, opt_name):
         found = []
-        for (line_type, components) in self._contents:
+        for line_type, components in self._contents:
             if line_type == "option":
-                (cfg_opt, cfg_value, _comment_tail) = components
+                cfg_opt, cfg_value, _comment_tail = components
                 if cfg_opt == opt_name:
                     found.append(cfg_value)
         return found
@@ -97,7 +97,7 @@ class ResolvConf:
             line_type, components = item
             if line_type != "option":
                 return False
-            (cfg_opt, _cfg_value, _comment_tail) = components
+            cfg_opt, _cfg_value, _comment_tail = components
             if cfg_opt != opt_name:
                 return False
             return True
@@ -134,19 +134,19 @@ class ResolvConf:
 
     def _parse(self, contents):
         entries = []
-        for (i, line) in enumerate(contents.splitlines()):
+        for i, line in enumerate(contents.splitlines()):
             sline = line.strip()
             if not sline:
                 entries.append(("blank", [line]))
                 continue
-            (head, tail) = chop_comment(line, ";#")
+            head, tail = chop_comment(line, ";#")
             if not len(head.strip()):
                 entries.append(("all_comment", [line]))
                 continue
             if not tail:
                 tail = ""
             try:
-                (cfg_opt, cfg_values) = head.split(None, 1)
+                cfg_opt, cfg_values = head.split(None, 1)
             except (IndexError, ValueError) as e:
                 raise IOError(
                     "Incorrectly formatted resolv.conf line %s" % (i + 1)

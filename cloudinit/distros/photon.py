@@ -7,7 +7,7 @@ import logging
 from cloudinit import distros, helpers, net, subp, util
 from cloudinit.distros import PackageList
 from cloudinit.distros import rhel_util as rhutil
-from cloudinit.settings import PER_INSTANCE
+from cloudinit.settings import PER_ALWAYS, PER_INSTANCE
 
 LOG = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ class Distro(distros.Distro):
     def exec_cmd(self, cmd, capture=True):
         LOG.debug("Attempting to run: %s", cmd)
         try:
-            (out, err) = subp.subp(cmd, capture=capture)
+            out, err = subp.subp(cmd, capture=capture)
             if err:
                 LOG.warning(
                     "Running %s resulted in stderr output: %s", cmd, err
@@ -156,10 +156,10 @@ class Distro(distros.Distro):
         if ret:
             LOG.error("Error while installing packages: %s", err)
 
-    def update_package_sources(self):
+    def update_package_sources(self, *, force=False):
         self._runner.run(
             "update-sources",
             self.package_command,
             ["makecache"],
-            freq=PER_INSTANCE,
+            freq=PER_ALWAYS if force else PER_INSTANCE,
         )

@@ -1,14 +1,20 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
 import os
+import stat
 from collections import namedtuple
+from unittest import mock
 
 import pytest
 
 import cloudinit.settings
 from cloudinit.cmd import clean
-from cloudinit.util import ensure_dir, sym_link, write_file
-from tests.unittests.helpers import mock, wrap_and_call
+from cloudinit.config import cc_mounts
+from cloudinit.distros import Distro
+from cloudinit.sources import DataSource
+from cloudinit.stages import Init
+from cloudinit.util import del_file, ensure_dir, sym_link, write_file
+from tests.unittests.helpers import wrap_and_call
 
 MyPaths = namedtuple("MyPaths", "cloud_dir")
 CleanPaths = namedtuple(
@@ -30,21 +36,14 @@ def clean_paths(tmpdir):
 
 @pytest.fixture(scope="function")
 def init_class(clean_paths):
-    class FakeInit:
-        cfg = {
-            "def_log_file": clean_paths.log,
-            "output": {"all": f"|tee -a {clean_paths.output_log}"},
-        }
-        # Ensure cloud_dir has a trailing slash, to match real behaviour
-        paths = MyPaths(cloud_dir=f"{clean_paths.cloud_dir}/")
-
-        def __init__(self, ds_deps):
-            pass
-
-        def read_cfg(self):
-            pass
-
-    return FakeInit
+    init = mock.Mock(spec=Init)
+    init.paths = MyPaths(cloud_dir=f"{clean_paths.cloud_dir}/")
+    init.distro.shutdown_command = Distro.shutdown_command
+    init.cfg = {
+        "def_log_file": clean_paths.log,
+        "output": {"all": f"|tee -a {clean_paths.output_log}"},
+    }
+    return init
 
 
 class TestClean:
@@ -56,10 +55,8 @@ class TestClean:
         assert (
             os.path.exists(clean_paths.cloud_dir) is False
         ), "Unexpected cloud_dir"
-        retcode = wrap_and_call(
-            "cloudinit.cmd.clean",
-            {"Init": {"side_effect": init_class}},
-            clean.remove_artifacts,
+        retcode = clean.remove_artifacts(
+            init=init_class,
             remove_logs=True,
         )
         assert (
@@ -93,10 +90,8 @@ class TestClean:
             "cloudinit.cmd.clean.GEN_NET_CONFIG_FILES",
             [f.strpath for f in TEST_GEN_NET_CONFIG_FILES],
         ):
-            retcode = wrap_and_call(
-                "cloudinit.cmd.clean",
-                {"Init": {"side_effect": init_class}},
-                clean.remove_artifacts,
+            retcode = clean.remove_artifacts(
+                init_class,
                 remove_logs=False,
                 remove_config=["network"],
             )
@@ -130,10 +125,8 @@ class TestClean:
             "cloudinit.cmd.clean.GEN_SSH_CONFIG_FILES",
             TEST_GEN_SSH_CONFIG_FILES,
         ):
-            retcode = wrap_and_call(
-                "cloudinit.cmd.clean",
-                {"Init": {"side_effect": init_class}},
-                clean.remove_artifacts,
+            retcode = clean.remove_artifacts(
+                init_class,
                 remove_logs=False,
                 remove_config=["ssh_config"],
             )
@@ -170,10 +163,8 @@ class TestClean:
             "cloudinit.cmd.clean.GEN_SSH_CONFIG_FILES",
             TEST_GEN_SSH_CONFIG_FILES,
         ):
-            retcode = wrap_and_call(
-                "cloudinit.cmd.clean",
-                {"Init": {"side_effect": init_class}},
-                clean.remove_artifacts,
+            retcode = clean.remove_artifacts(
+                init_class,
                 remove_logs=False,
                 remove_config=["all"],
             )
@@ -200,16 +191,156 @@ class TestClean:
             "cloudinit.cmd.clean.GEN_NET_CONFIG_FILES",
             TEST_GEN_NET_CONFIG_FILES,
         ):
-            retcode = wrap_and_call(
-                "cloudinit.cmd.clean",
-                {"Init": {"side_effect": init_class}},
-                clean.remove_artifacts,
+            retcode = clean.remove_artifacts(
+                init_class,
                 remove_logs=False,
                 remove_config=[],
             )
 
         for conf_path in TEST_GEN_NET_CONFIG_FILES:
             assert conf_path.exists() is True, f"file {conf_path} removed!"
+        assert 0 == retcode
+
+    @pytest.mark.usefixtures("fake_filesystem")
+    def test_clean_fstab(self, clean_paths, init_class):
+        """remove_config removed added entries in fstab when
+        `cloud-init clean -c fstab` is used.
+        """
+        fstab_original_content = (
+            "UUID=abc123 / ext4 defaults 0 0\n"
+            "/workspace	/mnt	"
+            "auto	defaults,nofail,x-systemd.after="
+            "cloud-init.service,_netdev,comment=cloudconfig	0	2\n"
+        )
+        fstab_expected_content = "UUID=abc123 / ext4 defaults 0 0\n"
+
+        etc_path = "/etc"
+        if not os.path.exists(etc_path):
+            os.makedirs(etc_path)
+        fstab_path = cc_mounts.FSTAB_PATH
+        with open(fstab_path, "w") as fd:
+            fd.write(fstab_original_content)
+
+        clean.remove_artifacts(
+            init_class,
+            remove_logs=False,
+            remove_config=["fstab"],
+        )
+
+        with open(fstab_path, "r") as fd:
+            fstab_new_content = fd.read()
+            assert fstab_expected_content == fstab_new_content
+
+    @pytest.mark.usefixtures("fake_filesystem")
+    def test_clean_fstab_for_all(self, clean_paths, init_class):
+        """remove_config removed added entries in fstab when
+        `cloud-init clean -c all` is used.
+        """
+        fstab_original_content = (
+            "UUID=abc123 / ext4 defaults 0 0\n"
+            "/workspace	/mnt	"
+            "auto	defaults,nofail,x-systemd.after="
+            "cloud-init.service,_netdev,comment=cloudconfig	0	2\n"
+        )
+        fstab_expected_content = "UUID=abc123 / ext4 defaults 0 0\n"
+        TEST_GEN_SSH_CONFIG_FILES = [
+            clean_paths.tmpdir.join(conf_file)
+            for conf_file in clean.GEN_SSH_CONFIG_FILES
+        ]
+
+        etc_path = "/etc"
+        if not os.path.exists(etc_path):
+            os.makedirs(etc_path)
+        fstab_path = cc_mounts.FSTAB_PATH
+        with open(fstab_path, "w") as fd:
+            fd.write(fstab_original_content)
+
+        with mock.patch(
+            "cloudinit.cmd.clean.GEN_SSH_CONFIG_FILES",
+            TEST_GEN_SSH_CONFIG_FILES,
+        ):
+
+            clean.remove_artifacts(
+                init_class,
+                remove_logs=False,
+                remove_config=["all"],
+            )
+
+        with open(fstab_path, "r") as fd:
+            fstab_new_content = fd.read()
+            assert fstab_expected_content == fstab_new_content
+
+    def test_clean_datasource_conf_without_cache(
+        self, clean_paths, init_class
+    ):
+        """remove_config does not remove datasource files when cache
+        is not present.
+        """
+        ds_conf = clean_paths.tmpdir.join("/var/run/ds")
+        assert ds_conf.exists() is False, f"Unexpected {ds_conf}"
+        ensure_dir(os.path.dirname(ds_conf))
+        ds_conf.write("#generated by generic DataSource\nfoobar\n")
+        assert ds_conf.exists() is True, "{ds_conf} not written!"
+
+        assert (
+            clean_paths.cloud_dir.exists() is False
+        ), "unexpected cloud_dir present!"
+
+        def ds_clean():
+            print("deleting {ds_conf}")
+            del_file(ds_conf)
+
+        ds = mock.Mock(spec=DataSource)
+        ds.clean = ds_clean
+
+        def ds_fetch():
+            return ds
+
+        init_class.fetch = ds_fetch
+        retcode = clean.remove_artifacts(
+            init_class,
+            remove_logs=False,
+            remove_config=["datasource"],
+        )
+        assert ds_conf.exists() is True, f"file {ds_conf} was removed!"
+        assert 0 == retcode
+
+    def test_clean_datasource_conf_with_cache(self, clean_paths, init_class):
+        """remove_config removes datasource files when cache
+        is present.
+        """
+        ensure_dir(clean_paths.cloud_dir)
+        ds_conf = clean_paths.tmpdir.join("/var/run/ds")
+        assert ds_conf.exists() is False, f"Unexpected {ds_conf}"
+        ensure_dir(os.path.dirname(ds_conf))
+        ds_conf.write("#generated by generic DataSource\nfoobar\n")
+        assert ds_conf.exists() is True, "{ds_conf} not written!"
+
+        cache = clean_paths.cloud_dir.join("instance")
+        assert cache.exists() is False, f"unexpected {cache} present!"
+        ensure_dir(cache)
+        assert cache.exists() is True, "{cache} not created!"
+
+        def ds_clean():
+            print("deleting {ds_conf}")
+            del_file(ds_conf)
+
+        ds = mock.Mock(spec=DataSource)
+        ds.clean = ds_clean
+
+        def ds_fetch():
+            return ds
+
+        init_class.fetch = ds_fetch
+        with mock.patch(
+            "cloudinit.cmd.clean.settings.CLEAN_RUNPARTS_DIR", os.devnull
+        ):
+            retcode = clean.remove_artifacts(
+                init_class,
+                remove_logs=False,
+                remove_config=["datasource"],
+            )
+        assert ds_conf.exists() is False, f"Unexpected file {ds_conf}"
         assert 0 == retcode
 
     @pytest.mark.allow_all_subp
@@ -225,12 +356,8 @@ class TestClean:
         with mock.patch.object(
             cloudinit.settings, "CLEAN_RUNPARTS_DIR", clean_paths.clean_dir
         ):
-            retcode = wrap_and_call(
-                "cloudinit.cmd.clean",
-                {
-                    "Init": {"side_effect": init_class},
-                },
-                clean.remove_artifacts,
+            retcode = clean.remove_artifacts(
+                init_class,
                 remove_logs=False,
             )
         assert (
@@ -243,10 +370,8 @@ class TestClean:
         clean_paths.log.write("cloud-init-log")
         clean_paths.output_log.write("cloud-init-output-log")
 
-        retcode = wrap_and_call(
-            "cloudinit.cmd.clean",
-            {"Init": {"side_effect": init_class}},
-            clean.remove_artifacts,
+        retcode = clean.remove_artifacts(
+            init_class,
             remove_logs=False,
         )
         assert 0 == retcode
@@ -269,10 +394,8 @@ class TestClean:
         with mock.patch.object(
             cloudinit.settings, "CLEAN_RUNPARTS_DIR", clean_paths.clean_dir
         ):
-            retcode = wrap_and_call(
-                "cloudinit.cmd.clean",
-                {"Init": {"side_effect": init_class}},
-                clean.remove_artifacts,
+            retcode = clean.remove_artifacts(
+                init_class,
                 remove_logs=False,
             )
         assert 0 == retcode
@@ -295,10 +418,8 @@ class TestClean:
         with mock.patch.object(
             cloudinit.settings, "CLEAN_RUNPARTS_DIR", clean_paths.clean_dir
         ):
-            retcode = wrap_and_call(
-                "cloudinit.cmd.clean",
-                {"Init": {"side_effect": init_class}},
-                clean.remove_artifacts,
+            retcode = clean.remove_artifacts(
+                init_class,
                 remove_logs=False,
             )
         assert 0 == retcode
@@ -323,10 +444,8 @@ class TestClean:
         with mock.patch.object(
             cloudinit.settings, "CLEAN_RUNPARTS_DIR", clean_paths.clean_dir
         ):
-            retcode = wrap_and_call(
-                "cloudinit.cmd.clean",
-                {"Init": {"side_effect": init_class}},
-                clean.remove_artifacts,
+            retcode = clean.remove_artifacts(
+                init_class,
                 remove_logs=False,
                 remove_seed=True,
             )
@@ -346,15 +465,13 @@ class TestClean:
         ensure_dir(clean_paths.cloud_dir)
         ensure_dir(clean_paths.cloud_dir.join("dir1"))
 
-        retcode = wrap_and_call(
-            "cloudinit.cmd.clean",
-            {
-                "del_dir": {"side_effect": OSError("oops")},
-                "Init": {"side_effect": init_class},
-            },
-            clean.remove_artifacts,
-            remove_logs=False,
-        )
+        with mock.patch(
+            "cloudinit.cmd.clean.del_dir", side_effect=OSError("oops")
+        ):
+            retcode = clean.remove_artifacts(
+                init_class,
+                remove_logs=False,
+            )
         assert 1 == retcode
         _out, err = capsys.readouterr()
         assert (
@@ -368,11 +485,11 @@ class TestClean:
         called_cmds = []
 
         def fake_subp(cmd, capture):
-            called_cmds.append((cmd, capture))
+            called_cmds.append(cmd)
             return "", ""
 
         myargs = namedtuple(
-            "MyArgs", "remove_logs remove_seed remove_config reboot machine_id"
+            "myargs", "remove_logs remove_seed remove_config reboot machine_id"
         )
         cmdargs = myargs(
             remove_logs=False,
@@ -385,14 +502,14 @@ class TestClean:
             "cloudinit.cmd.clean",
             {
                 "subp": {"side_effect": fake_subp},
-                "Init": {"side_effect": init_class},
+                "Init": {"return_value": init_class},
             },
             clean.handle_clean_args,
             name="does not matter",
             args=cmdargs,
         )
         assert 0 == retcode
-        assert [(["shutdown", "-r", "now"], False)] == called_cmds
+        assert [["shutdown", "-r", "now"]] == called_cmds
 
     @pytest.mark.parametrize(
         "machine_id,systemd_val",
@@ -411,7 +528,7 @@ class TestClean:
         """handle_clean_args removes /etc/machine-id when arg is True."""
         uses_systemd.return_value = systemd_val
         myargs = namedtuple(
-            "MyArgs", "remove_logs remove_seed remove_config reboot machine_id"
+            "myargs", "remove_logs remove_seed remove_config reboot machine_id"
         )
         cmdargs = myargs(
             remove_logs=False,
@@ -428,16 +545,13 @@ class TestClean:
             with mock.patch.object(
                 cloudinit.cmd.clean, "ETC_MACHINE_ID", machine_id_path.strpath
             ):
-                retcode = wrap_and_call(
-                    "cloudinit.cmd.clean",
-                    {
-                        "Init": {"side_effect": init_class},
-                    },
-                    clean.handle_clean_args,
-                    name="does not matter",
-                    args=cmdargs,
-                )
-        assert 0 == retcode
+                with mock.patch(
+                    "cloudinit.cmd.clean.Init", return_value=init_class
+                ):
+                    assert 0 == clean.handle_clean_args(
+                        name="does not matter",
+                        args=cmdargs,
+                    )
         if systemd_val:
             if machine_id:
                 assert "uninitialized\n" == machine_id_path.read()
@@ -453,7 +567,7 @@ class TestClean:
             wrap_and_call(
                 "cloudinit.cmd.clean",
                 {
-                    "Init": {"side_effect": init_class},
+                    "Init": {"return_value": init_class},
                     "sys.argv": {"new": ["clean", "--logs"]},
                 },
                 clean.main,
@@ -462,3 +576,34 @@ class TestClean:
         assert (
             clean_paths.log.exists() is False
         ), f"Unexpected log {clean_paths.log}"
+
+    @pytest.mark.parametrize("device_type", (stat.S_IFCHR, stat.S_IFBLK))
+    @pytest.mark.usefixtures("fake_filesystem")
+    def test_remove_artifacts_preserves_device_logs(
+        self, device_type, clean_paths, init_class
+    ):
+        """remove_artifacts does not remove log files that are device files."""
+        original_stat = os.stat
+
+        def mock_stat(path):
+            if path == clean_paths.log.strpath:
+                st_result = mock.Mock()
+                st_result.st_mode = device_type | 0o666
+                return st_result
+            return original_stat(path)
+
+        # Create a regular file and mock its stat
+        clean_paths.log.write("device-file")
+        clean_paths.output_log.write("cloud-init-output-log")
+        with mock.patch("cloudinit.cmd.clean.os.stat", side_effect=mock_stat):
+            retcode = clean.remove_artifacts(
+                init=init_class,
+                remove_logs=True,
+            )
+            assert 0 == retcode
+            assert (
+                clean_paths.log.exists() is True
+            ), f"Device file {clean_paths.log} should not be removed"
+            assert (
+                clean_paths.output_log.exists() is False
+            ), f"Regular log {clean_paths.output_log} should be removed"
